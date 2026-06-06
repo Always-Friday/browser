@@ -191,11 +191,11 @@ fn layerWith(self: anytype, next: Layer) Layer {
 
 pub const NextTickNode = struct {
     pub const Run =
-        *const fn (*Transfer, *anyopaque) void;
-    pub const Abort = *const fn (*anyopaque) void;
+        *const fn (*Transfer, ?*anyopaque) void;
+    pub const Abort = *const fn (?*anyopaque) void;
 
     node: std.DoublyLinkedList.Node = .{},
-    ctx: *anyopaque,
+    ctx: ?*anyopaque,
     run: Run,
     abort: ?Abort = null,
 };
@@ -473,7 +473,7 @@ pub fn tick(self: *Client, timeout_ms: u32, mode: DrainMode) !void {
 pub fn runNextTick(
     self: *Client,
     transfer: *Transfer,
-    ctx: *anyopaque,
+    ctx: ?*anyopaque,
     params: struct { run: NextTickNode.Run, abort: ?NextTickNode.Abort = null },
 ) !void {
     transfer._next_tick_node = .{ .ctx = ctx, .run = params.run, .abort = params.abort };
@@ -628,7 +628,7 @@ fn requestT(self: *Client, req: Request, owner: ?*Owner) !*Transfer {
     if (Synthetic.isSynthetic(req.url)) {
         // The 2nd transfer is the callback context. We don't actually use it,
         // we're just sticking transfer in there to have something.
-        self.runNextTick(transfer, transfer, .{ .run = Synthetic.run }) catch |err| {
+        self.runNextTick(transfer, null, .{ .run = Synthetic.run }) catch |err| {
             if (transfer.state == .created) {
                 transfer.abort(err);
             }
@@ -656,7 +656,7 @@ const Synthetic = struct {
         return std.mem.startsWith(u8, url, "data:") or std.mem.startsWith(u8, url, "blob:");
     }
 
-    fn run(transfer: *Transfer, _: *anyopaque) void {
+    fn run(transfer: *Transfer, _: ?*anyopaque) void {
         // prevents a callback that triggers a navigation queue from killing
         // this transfer from under us.
         transfer.state = .completing;
@@ -802,6 +802,14 @@ pub fn syncRequest(self: *Client, allocator: Allocator, req: Request) !SyncRespo
             }
             return err;
         };
+        if (sync_ctx.completion == .in_progress and self.inbox.contains(isSyncWaitInterrupt)) {
+            // A teardown/close command is queued but sync_wait can't dispatch
+            // it mid-parse (it would free the Page/Frame this stack holds).
+            // Abort the blocking fetch so the parser unwinds to the next safe
+            // drain and the command runs there, instead of stalling for the
+            // full per-request timeout per blocking script.
+            transfer.abort(error.SyncWaitInterrupted);
+        }
     }
 
     switch (sync_ctx.completion) {
@@ -1017,6 +1025,24 @@ fn isFetchInterceptionMethod(method: []const u8) bool {
         std.mem.eql(u8, method, "Fetch.failRequest") or
         std.mem.eql(u8, method, "Fetch.fulfillRequest") or
         std.mem.eql(u8, method, "Fetch.continueWithAuth");
+}
+
+// True for inbox messages that mean "this page/connection is going away".
+// syncRequest uses this to bail out of a blocking-script wait promptly
+// rather than holding the worker for the per-request timeout while a
+// teardown command sits undispatched behind the sync_wait allowlist.
+fn isSyncWaitInterrupt(msg: *Inbox.Message) bool {
+    return switch (msg.payload) {
+        .close, .disconnect => true,
+        .ping => false,
+        .cdp => |c| isTeardownMethod(c.input.method),
+    };
+}
+
+fn isTeardownMethod(method: []const u8) bool {
+    return std.mem.eql(u8, method, "Target.closeTarget") or
+        std.mem.eql(u8, method, "Target.disposeBrowserContext") or
+        std.mem.eql(u8, method, "Page.close");
 }
 
 fn processOneMessage(self: *Client, msg: http.Handles.MultiMessage, transfer: *Transfer) !bool {
@@ -2247,5 +2273,53 @@ test "HttpClient: allowDuringSyncWait denies non-Fetch CDP methods" {
             } },
         };
         try testing.expect(!allowDuringSyncWait(&msg));
+    }
+}
+
+test "HttpClient: isSyncWaitInterrupt matches teardown methods, close and disconnect" {
+    var raw_buf: [16]u8 = undefined;
+
+    inline for ([_][]const u8{
+        "Target.closeTarget",
+        "Target.disposeBrowserContext",
+        "Page.close",
+    }) |method| {
+        var msg = Inbox.Message{
+            .arena = testing.allocator,
+            .payload = .{ .cdp = .{
+                .raw = &raw_buf,
+                .input = .{ .method = method },
+            } },
+        };
+        try testing.expect(isSyncWaitInterrupt(&msg));
+    }
+
+    var close_msg = Inbox.Message{ .arena = testing.allocator, .payload = .close };
+    try testing.expect(isSyncWaitInterrupt(&close_msg));
+
+    var disconnect_msg = Inbox.Message{ .arena = testing.allocator, .payload = .{ .disconnect = null } };
+    try testing.expect(isSyncWaitInterrupt(&disconnect_msg));
+}
+
+test "HttpClient: isSyncWaitInterrupt ignores ping and non-teardown CDP methods" {
+    var ping_msg = Inbox.Message{ .arena = testing.allocator, .payload = .{ .ping = "" } };
+    try testing.expect(!isSyncWaitInterrupt(&ping_msg));
+
+    var raw_buf: [16]u8 = undefined;
+    inline for ([_][]const u8{
+        "Page.navigate",
+        "Runtime.evaluate",
+        "Target.createTarget",
+        "Fetch.continueRequest",
+        "",
+    }) |method| {
+        var msg = Inbox.Message{
+            .arena = testing.allocator,
+            .payload = .{ .cdp = .{
+                .raw = &raw_buf,
+                .input = .{ .method = method },
+            } },
+        };
+        try testing.expect(!isSyncWaitInterrupt(&msg));
     }
 }

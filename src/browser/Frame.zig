@@ -895,7 +895,10 @@ pub fn abortTransfers(self: *Frame) void {
     for (self.child_frames.items) |child| {
         child.abortTransfers();
     }
-    self._session.browser.http_client.abortOwner(&self._http_owner);
+    const http_client = &self._session.browser.http_client;
+    http_client.abortOwner(&self._http_owner);
+    // abortOwner misses deferred contexts whose transfer already completed.
+    http_client.deferring_layer.cancelFrame(self._frame_id);
 }
 
 pub fn documentIsLoaded(self: *Frame) void {
@@ -4381,7 +4384,7 @@ fn asUint(comptime string: anytype) std.meta.Int(
 }
 
 const testing = @import("../testing.zig");
-test "WebApi:Frame" {
+test "WebApi: Frame" {
     const filter: testing.LogFilter = .init(&.{.http});
     defer filter.deinit();
     try testing.htmlRunner("page", .{});
