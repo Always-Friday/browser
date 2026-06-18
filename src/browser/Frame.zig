@@ -99,6 +99,12 @@ _event_manager: EventManager,
 
 _parse_mode: enum { document, fragment, document_write } = .document,
 
+// While fragment-parsing (e.g. innerHTML), scripts are normally marked
+// "already started" so they never run. The one exception is
+// Range.createContextualFragment(), whose scripts DO run when the fragment is
+// inserted into a document
+_fragment_scripts_runnable: bool = false,
+
 // See Attribute.List for what this is. TL;DR: proper DOM Attribute Nodes are
 // fat yet rarely needed. We only create them on-demand, but still need proper
 // identity (a given attribute should return the same *Attribute), so we do
@@ -282,10 +288,22 @@ pub const HttpHeader = struct {
     value: []const u8,
 };
 
-pub fn init(self: *Frame, frame_id: u32, page: *Page, parent: ?*Frame) !void {
+pub const InitOpts = struct {
+    parent: ?*Frame = null,
+
+    // When a frame/popup re-navigates, we should preserve the same window.
+    // There are a couple reasons for this. First, iframe.contentWindow should
+    // maintain the same identity. Secondly, a reference to the window can be
+    // acquired prior to navigation, and then used after. So it should remain valid.
+    reuse_window: ?*Window = null,
+};
+
+pub fn init(self: *Frame, frame_id: u32, page: *Page, opts: InitOpts) !void {
     if (comptime IS_DEBUG) {
         log.debug(.frame, "frame.init", .{});
     }
+
+    const parent = opts.parent;
 
     const session = page.session;
     const call_arena = try session.getArena(.medium, "call_arena");
@@ -335,7 +353,7 @@ pub fn init(self: *Frame, frame_id: u32, page: *Page, parent: ?*Frame) !void {
         });
     }
 
-    self.window = try factory.eventTarget(Window{
+    const window_template = Window{
         ._frame = self,
         ._proto = undefined,
         ._document = self.document,
@@ -344,7 +362,16 @@ pub fn init(self: *Frame, frame_id: u32, page: *Page, parent: ?*Frame) !void {
         ._screen = screen,
         ._visual_viewport = visual_viewport,
         ._cross_origin_wrapper = undefined,
-    });
+    };
+
+    if (opts.reuse_window) |w| {
+        const proto = w._proto;
+        w.* = window_template;
+        w._proto = proto;
+        self.window = w;
+    } else {
+        self.window = try factory.eventTarget(window_template);
+    }
     self.window._cross_origin_wrapper = .{ .window = self.window };
 
     self._style_manager = try StyleManager.init(self);
@@ -1457,7 +1484,7 @@ pub fn iframeAddedCallback(self: *Frame, iframe: *IFrame) !void {
     const new_frame = try self.arena.create(Frame);
     const frame_id = session.nextFrameId();
 
-    try Frame.init(new_frame, frame_id, self._page, self);
+    try Frame.init(new_frame, frame_id, self._page, .{ .parent = self });
     errdefer new_frame.deinit();
 
     self._pending_loads += 1;
@@ -1581,7 +1608,7 @@ pub fn openPopup(self: *Frame, opts: OpenPopupOpts) !*Frame {
     errdefer page.frame_arena.destroy(popup);
 
     const frame_id = session.nextFrameId();
-    try Frame.init(popup, frame_id, page, null);
+    try Frame.init(popup, frame_id, page, .{});
     errdefer popup.deinit();
 
     popup.window._opener = opts.opener;
@@ -1684,24 +1711,17 @@ pub fn removeElementIdWithMaps(self: *Frame, id_maps: ElementIdMaps, id: []const
 }
 
 pub fn getElementByIdFromNode(self: *Frame, node: *Node, id: []const u8) ?*Element {
-    if (node.isConnected() or node.isInShadowTree()) {
-        var current = node;
-        while (true) {
-            if (current.is(ShadowRoot)) |shadow_root| {
-                return shadow_root.getElementById(id, self);
-            }
-            const parent = current._parent orelse {
-                if (current._type == .document) {
-                    return current._type.document.getElementById(id, self);
-                }
-                if (IS_DEBUG) {
-                    std.debug.assert(false);
-                }
-                return null;
-            };
-            current = parent;
-        }
+    // The id map lives on the node's root: a Document, or a ShadowRoot for
+    // shadow DOM. Walk to the root once and consult the matching map.
+    const root = node.getRootNode(.{});
+    if (root._type == .document) {
+        return root._type.document.getElementById(id, self);
     }
+    if (root.is(ShadowRoot)) |shadow_root| {
+        return shadow_root.getElementById(id, self);
+    }
+    // Detached subtree (root is neither a Document nor a ShadowRoot): no id map
+    // exists, so scan it.
     var tw = @import("webapi/TreeWalker.zig").Full.Elements.init(node, .{});
     while (tw.next()) |el| {
         const element_id = el.getAttributeSafe(comptime .wrap("id")) orelse continue;
@@ -3624,15 +3644,26 @@ pub fn updateRangesForNodeRemoval(self: *Frame, parent: *Node, child: *Node, chi
 
 // TODO: optimize and cleanup, this is called a lot (e.g., innerHTML = '')
 pub fn parseHtmlAsChildren(self: *Frame, node: *Node, html: []const u8) !void {
-    return self.parseHtmlAsChildrenInner(node, html, false);
+    return self.parseHtmlAsChildrenInner(node, html, .{});
 }
 
 // setHTMLUnsafe variant: parse a fragment that may contain declarative shadow node
 pub fn parseHtmlUnsafeAsChildren(self: *Frame, node: *Node, html: []const u8) !void {
-    return self.parseHtmlAsChildrenInner(node, html, true);
+    return self.parseHtmlAsChildrenInner(node, html, .{ .allow_declarative_shadow = true });
 }
 
-fn parseHtmlAsChildrenInner(self: *Frame, node: *Node, html: []const u8, allow_declarative_shadow: bool) !void {
+// Range.createContextualFragment variant: unlike innerHTML et al., its scripts
+// are run when the fragment is inserted into a document.
+pub fn parseContextualFragment(self: *Frame, node: *Node, html: []const u8) !void {
+    return self.parseHtmlAsChildrenInner(node, html, .{ .scripts_runnable = true });
+}
+
+const FragmentParseOpts = struct {
+    scripts_runnable: bool = false,
+    allow_declarative_shadow: bool = false,
+};
+
+fn parseHtmlAsChildrenInner(self: *Frame, node: *Node, html: []const u8, opts: FragmentParseOpts) !void {
     const previous_parse_mode = self._parse_mode;
     self._parse_mode = .fragment;
     defer self._parse_mode = previous_parse_mode;
@@ -3652,7 +3683,11 @@ fn parseHtmlAsChildrenInner(self: *Frame, node: *Node, html: []const u8, allow_d
         }
     };
 
-    var parser = Parser.init(self.call_arena, node, self, .{ .allow_declarative_shadow = allow_declarative_shadow });
+    const previous_scripts_runnable = self._fragment_scripts_runnable;
+    self._fragment_scripts_runnable = opts.scripts_runnable;
+    defer self._fragment_scripts_runnable = previous_scripts_runnable;
+
+    var parser = Parser.init(self.call_arena, node, self, .{ .allow_declarative_shadow = opts.allow_declarative_shadow });
     parser.parseFragment(html);
 
     // html5ever wraps fragment output in an <html> element; unwrap so its
@@ -3687,7 +3722,14 @@ fn parseHtmlAsChildrenInner(self: *Frame, node: *Node, html: []const u8, allow_d
 
 fn nodeIsReady(self: *Frame, comptime from_parser: bool, node: *Node) !void {
     if ((comptime from_parser) and self._parse_mode == .fragment) {
-        // we don't execute scripts added via innerHTML = '<script...';
+        if (self._fragment_scripts_runnable == false) {
+            // We don't execute scripts added via innerHTML = '<script...'. Mark
+            // them "already started" so they stay inert even after the parsed
+            // nodes are inserted into a connected document.
+            if (node.is(Element.Html.Script)) |script| {
+                script._executed = true;
+            }
+        }
         return;
     }
     // A node's "ready" work (running a <script>, loading an <iframe> / <link> /
