@@ -177,6 +177,10 @@ _http_owner: HttpClient.Owner = .{},
 // List of active live ranges (for mutation updates per DOM spec)
 _live_ranges: std.DoublyLinkedList = .{},
 
+// List of open BroadcastChannels, used to route postMessage between same-named
+// channels in this frame's origin
+_broadcast_channels: std.DoublyLinkedList = .{},
+
 // List of active MutationObservers
 _mutation_observers: std.DoublyLinkedList = .{},
 _mutation_delivery_scheduled: bool = false,
@@ -1123,7 +1127,7 @@ fn notifyParentLoadComplete(self: *Frame) void {
     parent.iframeCompletedLoading(self.iframe.?);
 }
 
-fn frameHeaderDoneCallback(response: HttpClient.Response) !bool {
+fn frameHeaderDoneCallback(response: HttpClient.Response) !HttpClient.HeaderResult {
     var self: *Frame = @ptrCast(@alignCast(response.ctx));
 
     // Commit point for a pending root navigation. The session has been
@@ -1194,7 +1198,7 @@ fn frameHeaderDoneCallback(response: HttpClient.Response) !bool {
         });
     }
 
-    return true;
+    return .proceed;
 }
 
 fn frameDataCallback(response: HttpClient.Response, data: []const u8) !void {
