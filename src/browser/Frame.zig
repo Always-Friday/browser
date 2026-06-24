@@ -58,6 +58,7 @@ const CSSStyleSheet = @import("webapi/css/CSSStyleSheet.zig");
 const CustomElementDefinition = @import("webapi/CustomElementDefinition.zig");
 const PageTransitionEvent = @import("webapi/event/PageTransitionEvent.zig");
 const SubmitEvent = @import("webapi/event/SubmitEvent.zig");
+const HashChangeEvent = @import("webapi/event/HashChangeEvent.zig");
 const popover = @import("webapi/element/popover.zig");
 const slotting = @import("webapi/element/slotting.zig");
 const NavigationKind = @import("webapi/navigation/root.zig").NavigationKind;
@@ -725,7 +726,7 @@ pub fn navigate(self: *Frame, request_url: [:0]const u8, opts: NavigateOpts) !vo
     // and the in-flight transfer survives the OLD page's frame.deinit which
     // calls http_client.abortList() on the shared frame_id during
     // commitPendingPage.
-    const is_pending_root = self._page._state == .pending;
+    const is_pending_root = self._page.replaces != null;
 
     // We dispatch frame_navigate event before sending the request.
     // It ensures the event frame_navigated is not dispatched before this one.
@@ -832,6 +833,7 @@ fn scheduleNavigationWithArena(originator: *Frame, arena: Allocator, request_url
     // fragment). Identical URLs fall through and trigger a real reload.
     const is_fragment_navigation = !std.mem.eql(u8, target.url, resolved_url) and URL.eqlDocument(target.url, resolved_url);
     if (!opts.force and is_fragment_navigation) {
+        const old_url = target.url;
         target.url = try target.arena.dupeZ(u8, resolved_url);
 
         const location = try Location.init(target.url, target);
@@ -842,6 +844,9 @@ fn scheduleNavigationWithArena(originator: *Frame, arena: Allocator, request_url
         if (target.parent == null) {
             try session.navigation.updateEntries(target.url, opts.kind, target, true);
         }
+
+        try target.queueHashChange(old_url, target.url);
+
         // don't defer this, the caller is responsible for freeing it on error
         session.releaseArena(arena);
         return;
@@ -1120,8 +1125,8 @@ fn frameHeaderDoneCallback(response: HttpClient.Response) !HttpClient.HeaderResu
     // frame_remove (clears OLD V8 context group + CDP node_registry),
     // tears down the OLD page, flips the pointer, and dispatches
     // frame_created against the new (now active) frame.
-    if (self._page._state == .pending) {
-        try self._session.commitPendingPage();
+    if (self._page.replaces != null) {
+        try self._session.commitPendingPage(self._page);
     }
 
     const response_url = response.url();
@@ -1566,8 +1571,8 @@ fn frameErrorCallback(ctx: *anyopaque, err: anyerror) void {
     // pending Page; the OLD active Page (and its V8 context) is untouched.
     // We do NOT run frameDoneCallback against the pending frame — the frame
     // is about to be freed.
-    if (self._page._state == .pending) {
-        self._session.discardPendingPage();
+    if (self._page.replaces != null) {
+        self._session.discardPendingPage(self._page);
         return;
     }
 
@@ -1929,6 +1934,49 @@ pub fn queueElementEvent(self: *Frame, element: *Element.Html, kind: QueuedEvent
             }
         }.cleanup, 0, .{ .name = "frame.dispatchQueuedEvents" });
     }
+}
+
+const HashChangeCallback = struct {
+    frame: *Frame,
+    old_url: []const u8,
+    new_url: []const u8,
+
+    // Called by the scheduler if the task is dropped before it runs (e.g. the
+    // page is torn down).
+    fn cancelled(ctx: *anyopaque) void {
+        const self: *HashChangeCallback = @ptrCast(@alignCast(ctx));
+        self.frame._factory.destroy(self);
+    }
+
+    fn run(ctx: *anyopaque) !?u32 {
+        const self: *HashChangeCallback = @ptrCast(@alignCast(ctx));
+        defer self.frame._factory.destroy(self);
+
+        const frame = self.frame;
+        const target = frame.window.asEventTarget();
+        if (!frame._event_manager.hasDirectListeners(target, "hashchange", frame.window._on_hashchange)) {
+            return null;
+        }
+
+        const event = (try HashChangeEvent.initTrusted(comptime .wrap("hashchange"), .{
+            .oldURL = self.old_url,
+            .newURL = self.new_url,
+        }, frame)).asEvent();
+        try frame._event_manager.dispatchDirect(target, event, frame.window._on_hashchange, .{ .context = "Hash Change" });
+        return null;
+    }
+};
+
+pub fn queueHashChange(self: *Frame, old_url: []const u8, new_url: []const u8) !void {
+    const callback = try self._factory.create(HashChangeCallback{
+        .frame = self,
+        .old_url = old_url,
+        .new_url = new_url,
+    });
+    try self.js.scheduler.add(callback, HashChangeCallback.run, 0, .{
+        .name = "frame.hashChange",
+        .finalizer = HashChangeCallback.cancelled,
+    });
 }
 
 // Hard cap on a single external stylesheet body. CSS rule storage is per-
@@ -3274,9 +3322,10 @@ test "Page: isSameOrigin" {
 }
 
 test "Frame: httpMetadata after navigation" {
-    const frame = try testing.pageTest("page/meta.html", .{});
-    defer testing.test_session.removePage();
-    const meta = frame.httpMetadata();
+    const page = try testing.pageTest("page/meta.html", .{});
+    defer page.close();
+
+    const meta = page.frame().?.httpMetadata();
     try testing.expect(meta.status != null);
     try std.testing.expectEqual(@as(u16, 200), meta.status.?);
     try testing.expect(meta.headers.len > 0);
@@ -3284,17 +3333,21 @@ test "Frame: httpMetadata after navigation" {
 }
 
 test "Frame: httpMetadata 404" {
-    const frame = try testing.pageTest("nonexistent_page_xyz.html", .{});
-    defer testing.test_session.removePage();
-    const meta = frame.httpMetadata();
+    const page = try testing.pageTest("nonexistent_page_xyz.html", .{});
+    defer page.close();
+
+    const meta = page.frame().?.httpMetadata();
     try testing.expect(meta.status != null);
     try testing.expectEqual(404, meta.status.?);
 }
 
 test "Frame: 401" {
-    var frame = try testing.pageTest("401", .{});
     defer testing.reset();
-    defer frame._session.removePage();
+
+    var page = try testing.pageTest("401", .{});
+    defer page.close();
+
+    const frame = page.frame().?;
 
     var buf = std.Io.Writer.Allocating.init(testing.allocator);
     defer buf.deinit();

@@ -298,6 +298,10 @@ pub fn navigateInner(
         new_url = try arena.dupeZ(u8, new_url);
     }
 
+    // Captured before the switch overwrites frame.url in the same_document
+    // branches; used to queue the hashchange once below.
+    const old_url = frame.url;
+
     const previous = self.getCurrentEntry();
 
     switch (kind) {
@@ -343,6 +347,10 @@ pub fn navigateInner(
         .reload => {
             try frame.scheduleNavigation(url, .{ .reason = .navigation, .kind = kind }, .{ .script = frame });
         },
+    }
+
+    if (is_same_document and !std.mem.eql(u8, old_url, new_url)) {
+        try frame.queueHashChange(old_url, new_url);
     }
 
     if (self._on_currententrychange) |cec| {
@@ -494,8 +502,8 @@ pub const JsApi = struct {
 const testing = @import("../../../testing.zig");
 
 test "Navigation: about:blank commits entry" {
-    const frame = try testing.test_session.createPage();
-    defer testing.test_session.removePage();
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
 
     // The test_session is shared; prior tests leak entries into it via
     // session.navigation. Reset it so we exercise a fresh session-style state.
@@ -523,8 +531,8 @@ test "Navigation: about:blank commits entry" {
 }
 
 test "Navigation: reload on empty stack seeds an entry" {
-    const frame = try testing.test_session.createPage();
-    defer testing.test_session.removePage();
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
 
     testing.test_session.navigation._entries.clearRetainingCapacity();
     testing.test_session.navigation._index = 0;
