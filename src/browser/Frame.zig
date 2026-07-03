@@ -119,6 +119,10 @@ _attribute_named_node_map_lookup: std.AutoHashMapUnmanaged(usize, *Element.Attri
 // Lazily-created style, classList, and dataset objects. Only stored for elements
 // that actually access these features via JavaScript, saving 24 bytes per element.
 _element_styles: Element.StyleLookup = .empty,
+// Computed-style views handed out by window.getComputedStyle. The computed
+// variant is a stateless lazy view, so one per element suffices — and Chrome
+// returns the same object for repeated calls, so identity is also conformance.
+_element_computed_styles: Element.StyleLookup = .empty,
 _element_datasets: Element.DatasetLookup = .empty,
 _element_class_lists: Element.ClassListLookup = .empty,
 _element_rel_lists: Element.RelListLookup = .empty,
@@ -251,9 +255,14 @@ js: *JS.Context,
 // An arena for the lifetime of the frame.
 arena: Allocator,
 
-// An arena with a lifetime guaranteed to be for 1 invoking of a Zig function
-// from JS. Best arena to use, when possible.
+// An arena with a lifetime for at least the scope of one Zig invocation from
+// JS. Prefer local_arena where possible. Use call_arena when allocations may
+// need to call back into JS (event dispatch, forEach callback, ....)
 call_arena: Allocator,
+
+// An arena with a lifetime guaranteed to be for exactly 1 invoking of a Zig
+// function from JS. Best arena to use, when possible.
+local_arena: Allocator,
 
 parent: ?*Frame,
 window: *Window,
@@ -306,6 +315,9 @@ pub fn init(self: *Frame, frame_id: u32, page: *Page, opts: InitOpts) !void {
     const call_arena = try session.getArena(.medium, "call_arena");
     errdefer session.releaseArena(call_arena);
 
+    const local_arena = try session.getArena(.medium, "local_arena");
+    errdefer session.releaseArena(local_arena);
+
     const factory = &page.factory;
     const document = (try factory.document(Node.Document.HTMLDocument{
         ._proto = undefined,
@@ -320,6 +332,7 @@ pub fn init(self: *Frame, frame_id: u32, page: *Page, opts: InitOpts) !void {
         .document = document,
         .window = undefined,
         .call_arena = call_arena,
+        .local_arena = local_arena,
         ._frame_id = frame_id,
         ._page = page,
         ._session = session,
@@ -382,6 +395,7 @@ pub fn init(self: *Frame, frame_id: u32, page: *Page, opts: InitOpts) !void {
         .identity = &page.identity,
         .identity_arena = arena,
         .call_arena = self.call_arena,
+        .local_arena = self.local_arena,
     });
     errdefer browser.env.destroyContext(self.js);
 
@@ -480,6 +494,7 @@ pub fn deinit(self: *Frame) void {
     self._style_manager.deinit();
 
     page.releaseArena(self.call_arena);
+    page.releaseArena(self.local_arena);
 }
 
 pub fn trackWorker(self: *Frame, worker: *Worker) !void {
@@ -1329,6 +1344,10 @@ fn urlBasename(arena: Allocator, url: []const u8) !?[]const u8 {
     return try arena.dupe(u8, name);
 }
 
+fn isUtf16Encoding(charset: []const u8) bool {
+    return std.mem.eql(u8, charset, "UTF-16LE") or std.mem.eql(u8, charset, "UTF-16BE");
+}
+
 fn frameDataCallback(response: HttpClient.Response, data: []const u8) !void {
     var self: *Frame = @ptrCast(@alignCast(response.ctx));
 
@@ -1344,8 +1363,10 @@ fn frameDataCallback(response: HttpClient.Response, data: []const u8) !void {
 
         // If the HTTP Content-Type header didn't specify a charset and this is HTML,
         // prescan the first 1024 bytes for a <meta charset> declaration.
+        var html_prescan_found_charset = false;
         if (mime.content_type == .text_html and mime.is_default_charset) {
             if (Mime.prescanCharset(data)) |charset| {
+                html_prescan_found_charset = true;
                 if (charset.len <= 40) {
                     @memcpy(mime.charset[0..charset.len], charset);
                     mime.charset[charset.len] = 0;
@@ -1369,7 +1390,8 @@ fn frameDataCallback(response: HttpClient.Response, data: []const u8) !void {
                 const charset_str = mime.charsetString();
                 const info = h5e.encoding_for_label(charset_str.ptr, charset_str.len);
                 if (info.isValid()) {
-                    self.charset = info.name();
+                    const name = info.name();
+                    self.charset = if (html_prescan_found_charset and isUtf16Encoding(name)) "UTF-8" else name;
                 }
                 self._parse_state = .{ .html = .{
                     .buffer = .empty,
@@ -2186,6 +2208,27 @@ fn dispatchQueuedEvents(self: *Frame) !void {
 
 pub fn scheduleCustomElementBackupDrain(self: *Frame) !void {
     try self.js.queueCustomElementBackupDrain();
+}
+
+// Run the network-idle notification checks for this frame and, recursively,
+// its child frames. CDP clients (e.g. puppeteer's networkidle0) expect the
+// networkIdle/networkAlmostIdle lifecycle events on every frame, like Chrome
+// emits them, not just on the root frame.
+pub fn checkIdleNotifications(self: *Frame, total_http_activity: usize) void {
+    switch (self._parse_state) {
+        .html, .complete => {
+            if (self._notified_network_almost_idle.check(total_http_activity <= 2)) {
+                self.notifyNetworkAlmostIdle();
+            }
+            if (self._notified_network_idle.check(total_http_activity == 0)) {
+                self.notifyNetworkIdle();
+            }
+        },
+        else => {},
+    }
+    for (self.child_frames.items) |child| {
+        child.checkIdleNotifications(total_http_activity);
+    }
 }
 
 pub fn notifyNetworkIdle(self: *Frame) void {
