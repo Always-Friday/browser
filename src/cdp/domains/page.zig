@@ -149,8 +149,8 @@ fn setLifecycleEventsEnabled(cmd: *CDP.Command) !void {
 
         const http_client = frame._session.browser.http_client;
         const http_active = http_client.http_active;
-        const http_next_tick = http_client.next_tick_count;
-        const total_network_activity = http_active + http_next_tick + http_client.interception_layer.intercepted;
+        const http_buffered = http_client.dispatch_count;
+        const total_network_activity = http_active + http_buffered + http_client.intercepted;
         if (frame._notified_network_almost_idle.check(total_network_activity <= 2)) {
             try sendPageLifecycle(bc, "networkAlmostIdle", now, frame_id, loader_id);
         }
@@ -309,6 +309,7 @@ fn navigate(cmd: *CDP.Command) !void {
     const frame = bc.mainFrame() orelse return error.FrameNotLoaded;
 
     const encoded_url = try URL.resolveNavigation(frame.call_arena, params.url, .{});
+    std.debug.print("URL: {s}\n", .{encoded_url});
 
     // Fast path: a freshly-created target whose root frame hasn't navigated
     // yet has nothing to preserve across the HTTP round-trip. Skip the
