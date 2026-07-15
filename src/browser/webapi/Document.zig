@@ -21,6 +21,7 @@ const lp = @import("lightpanda");
 
 const js = @import("../js/js.zig");
 const Frame = @import("../Frame.zig");
+const Window = @import("Window.zig");
 const URL = @import("../URL.zig");
 const idna = @import("../../sys/idna.zig");
 const public_suffix_list = @import("../../data/public_suffix_list.zig");
@@ -53,6 +54,8 @@ _type: Type,
 _proto: *Node,
 _frame: ?*Frame = null,
 _url: ?[:0]const u8 = null, // URL for documents created via DOMImplementation (about:blank)
+// content type override for documents created via DOMImplementation.createDocument
+_content_type: ?[]const u8 = null,
 _ready_state: ReadyState = .loading,
 _current_script: ?*Element.Html.Script = null,
 _elements_by_id: std.StringHashMapUnmanaged(*Element) = .empty,
@@ -86,6 +89,22 @@ pub fn setOnSelectionChange(self: *Document, listener: ?js.Function) !void {
         self._on_selectionchange = try listen.persistWithThis(self);
     } else {
         self._on_selectionchange = null;
+    }
+}
+
+// Stored in the frame's attribute-listener map (like element and ShadowRoot
+// property handlers), which the dispatch propagation path consults for any
+// event target.
+pub fn getOnClick(self: *Document, frame: *Frame) ?js.Function.Global {
+    return (self._frame orelse frame)._event_target_attr_listeners.get(.{ .target = self.asEventTarget(), .handler = .onclick });
+}
+
+pub fn setOnClick(self: *Document, setter: ?Window.FunctionSetter, frame: *Frame) !void {
+    const owner = self._frame orelse frame;
+    if (Window.getFunctionFromSetter(setter)) |cb| {
+        try owner._event_target_attr_listeners.put(owner.arena, .{ .target = self.asEventTarget(), .handler = .onclick }, cb);
+    } else {
+        _ = owner._event_target_attr_listeners.remove(.{ .target = self.asEventTarget(), .handler = .onclick });
     }
 }
 
@@ -141,6 +160,9 @@ pub fn setLocation(self: *Document, url: [:0]const u8) !void {
 }
 
 pub fn getContentType(self: *const Document) []const u8 {
+    if (self._content_type) |content_type| {
+        return content_type;
+    }
     return switch (self._type) {
         .html => "text/html",
         .xml => "application/xml",
@@ -283,7 +305,7 @@ pub fn createElement(self: *Document, name: []const u8, options_: ?CreateElement
 }
 
 pub fn createElementNS(self: *Document, namespace: ?[]const u8, name: []const u8, frame: *Frame) !*Element {
-    try validateElementName(name);
+    _ = try validateAndExtract(namespace, name, .element);
     const ns = Element.Namespace.parse(namespace);
     // Per spec, createElementNS does NOT lowercase (unlike createElement).
     const node = try Frame.node_factory.createElementNS(frame, ns, name, null);
@@ -402,7 +424,7 @@ pub fn querySelectorAll(self: *Document, input: String, frame: *Frame) !*Selecto
 
 pub fn getImplementation(self: *Document, frame: *Frame) !*DOMImplementation {
     if (self._implementation) |impl| return impl;
-    const impl = try frame._factory.create(DOMImplementation{});
+    const impl = try frame._factory.create(DOMImplementation{ ._document = self });
     self._implementation = impl;
     return impl;
 }
@@ -468,56 +490,85 @@ pub fn createEvent(_: *const Document, event_type: []const u8, frame: *Frame) !*
     }
     const normalized = std.ascii.lowerString(&frame.buf, event_type);
 
-    if (std.mem.eql(u8, normalized, "event") or std.mem.eql(u8, normalized, "events") or std.mem.eql(u8, normalized, "htmlevents")) {
-        return Event.init("", null, frame._page);
-    }
+    const event: *Event = blk: {
+        if (std.mem.eql(u8, normalized, "event") or std.mem.eql(u8, normalized, "events") or std.mem.eql(u8, normalized, "htmlevents") or std.mem.eql(u8, normalized, "svgevents")) {
+            break :blk try Event.init("", null, frame._page);
+        }
 
-    if (std.mem.eql(u8, normalized, "customevent") or std.mem.eql(u8, normalized, "customevents")) {
-        const CustomEvent = @import("event/CustomEvent.zig");
-        return (try CustomEvent.init("", null, frame._page)).asEvent();
-    }
+        if (std.mem.eql(u8, normalized, "customevent") or std.mem.eql(u8, normalized, "customevents")) {
+            const CustomEvent = @import("event/CustomEvent.zig");
+            break :blk (try CustomEvent.init("", null, frame._page)).asEvent();
+        }
 
-    if (std.mem.eql(u8, normalized, "keyboardevent")) {
-        const KeyboardEvent = @import("event/KeyboardEvent.zig");
-        return (try KeyboardEvent.init("", null, frame)).asEvent();
-    }
+        if (std.mem.eql(u8, normalized, "keyboardevent")) {
+            const KeyboardEvent = @import("event/KeyboardEvent.zig");
+            break :blk (try KeyboardEvent.init("", null, frame)).asEvent();
+        }
 
-    if (std.mem.eql(u8, normalized, "inputevent")) {
-        const InputEvent = @import("event/InputEvent.zig");
-        return (try InputEvent.init("", null, frame)).asEvent();
-    }
+        if (std.mem.eql(u8, normalized, "inputevent")) {
+            const InputEvent = @import("event/InputEvent.zig");
+            break :blk (try InputEvent.init("", null, frame)).asEvent();
+        }
 
-    if (std.mem.eql(u8, normalized, "mouseevent") or std.mem.eql(u8, normalized, "mouseevents")) {
-        const MouseEvent = @import("event/MouseEvent.zig");
-        return (try MouseEvent.init("", null, frame)).asEvent();
-    }
+        if (std.mem.eql(u8, normalized, "mouseevent") or std.mem.eql(u8, normalized, "mouseevents")) {
+            const MouseEvent = @import("event/MouseEvent.zig");
+            break :blk (try MouseEvent.init("", null, frame)).asEvent();
+        }
 
-    if (std.mem.eql(u8, normalized, "messageevent")) {
-        const MessageEvent = @import("event/MessageEvent.zig");
-        return (try MessageEvent.init("", null, frame._page)).asEvent();
-    }
+        if (std.mem.eql(u8, normalized, "dragevent")) {
+            const DragEvent = @import("event/DragEvent.zig");
+            break :blk (try DragEvent.init("", null, frame)).asEvent();
+        }
 
-    if (std.mem.eql(u8, normalized, "uievent") or std.mem.eql(u8, normalized, "uievents")) {
-        const UIEvent = @import("event/UIEvent.zig");
-        return (try UIEvent.init("", null, frame)).asEvent();
-    }
+        if (std.mem.eql(u8, normalized, "messageevent")) {
+            const MessageEvent = @import("event/MessageEvent.zig");
+            break :blk (try MessageEvent.init("", null, frame._page)).asEvent();
+        }
 
-    if (std.mem.eql(u8, normalized, "focusevent") or std.mem.eql(u8, normalized, "focusevents")) {
-        const FocusEvent = @import("event/FocusEvent.zig");
-        return (try FocusEvent.init("", null, frame)).asEvent();
-    }
+        if (std.mem.eql(u8, normalized, "hashchangeevent")) {
+            const HashChangeEvent = @import("event/HashChangeEvent.zig");
+            break :blk (try HashChangeEvent.init("", null, frame)).asEvent();
+        }
 
-    if (std.mem.eql(u8, normalized, "textevent") or std.mem.eql(u8, normalized, "textevents")) {
-        const TextEvent = @import("event/TextEvent.zig");
-        return (try TextEvent.init("", null, frame)).asEvent();
-    }
+        if (std.mem.eql(u8, normalized, "uievent") or std.mem.eql(u8, normalized, "uievents")) {
+            const UIEvent = @import("event/UIEvent.zig");
+            break :blk (try UIEvent.init("", null, frame)).asEvent();
+        }
 
-    if (std.mem.eql(u8, normalized, "compositionevent")) {
-        const CompositionEvent = @import("event/CompositionEvent.zig");
-        return (try CompositionEvent.init("", null, frame)).asEvent();
-    }
+        if (std.mem.eql(u8, normalized, "focusevent") or std.mem.eql(u8, normalized, "focusevents")) {
+            const FocusEvent = @import("event/FocusEvent.zig");
+            break :blk (try FocusEvent.init("", null, frame)).asEvent();
+        }
 
-    return error.NotSupported;
+        if (std.mem.eql(u8, normalized, "textevent") or std.mem.eql(u8, normalized, "textevents")) {
+            const TextEvent = @import("event/TextEvent.zig");
+            break :blk (try TextEvent.init("", null, frame)).asEvent();
+        }
+
+        if (std.mem.eql(u8, normalized, "compositionevent")) {
+            const CompositionEvent = @import("event/CompositionEvent.zig");
+            break :blk (try CompositionEvent.init("", null, frame)).asEvent();
+        }
+
+        // Aliases the spec requires createEvent to support but whose
+        // interfaces aren't implemented yet: return a plain Event so the
+        // caller can at least initialize and dispatch it.
+        if (std.mem.eql(u8, normalized, "beforeunloadevent") or
+            std.mem.eql(u8, normalized, "devicemotionevent") or
+            std.mem.eql(u8, normalized, "deviceorientationevent") or
+            std.mem.eql(u8, normalized, "storageevent"))
+        {
+            log.info(.not_implemented, "createEvent interface", .{ .type = event_type });
+            break :blk try Event.init("", null, frame._page);
+        }
+
+        return error.NotSupported;
+    };
+
+    // createEvent returns an uninitialized event: dispatching it before one
+    // of the init*Event calls throws an InvalidStateError.
+    event._initialized = false;
+    return event;
 }
 
 pub fn createTreeWalker(_: *const Document, root: *Node, what_to_show: ?js.Value, filter: ?DOMTreeWalker.FilterOpts, frame: *Frame) !*DOMTreeWalker {
@@ -1193,26 +1244,118 @@ fn validateDocumentNodes(self: *Document, nodes: []const Node.NodeOrText, compti
     }
 }
 
-fn validateElementName(name: []const u8) !void {
+// DOM §1.4 "Name validation" productions.
+
+pub fn isValidElementLocalName(name: []const u8) bool {
     if (name.len == 0) {
-        return error.InvalidCharacterError;
+        return false;
     }
-
-    const first = name[0];
-    // Element names cannot start with: digits, period, hyphen
-    if ((first >= '0' and first <= '9') or first == '.' or first == '-') {
-        return error.InvalidCharacterError;
+    if (std.ascii.isAlphabetic(name[0])) {
+        // Names the HTML parser can construct: anything except ASCII
+        // whitespace, NUL, '/' or '>'.
+        for (name[1..]) |c| {
+            switch (c) {
+                '\t', '\n', 0x0C, '\r', ' ', 0, '/', '>' => return false,
+                else => {},
+            }
+        }
+        return true;
     }
-
+    // Otherwise the first code point must be ':', '_' or beyond ASCII, and
+    // the rest restricted to alphanumerics, '-', '.', ':', '_' or non-ASCII.
+    if (name[0] != ':' and name[0] != '_' and name[0] < 0x80) {
+        return false;
+    }
     for (name[1..]) |c| {
-        const is_valid = std.ascii.isAlphanumeric(c) or
-            c == '_' or c == '-' or c == '.' or c == ':' or
-            c >= 128; // Allow non-ASCII UTF-8
+        const valid = std.ascii.isAlphanumeric(c) or
+            c == '-' or c == '.' or c == ':' or c == '_' or c >= 0x80;
+        if (!valid) {
+            return false;
+        }
+    }
+    return true;
+}
 
-        if (!is_valid) {
+pub fn isValidNamespacePrefix(prefix: []const u8) bool {
+    if (prefix.len == 0) {
+        return false;
+    }
+    for (prefix) |c| {
+        switch (c) {
+            '\t', '\n', 0x0C, '\r', ' ', 0, '/', '>' => return false,
+            else => {},
+        }
+    }
+    return true;
+}
+
+pub fn isValidAttributeLocalName(name: []const u8) bool {
+    if (name.len == 0) {
+        return false;
+    }
+    for (name) |c| {
+        switch (c) {
+            '\t', '\n', 0x0C, '\r', ' ', 0, '/', '=', '>' => return false,
+            else => {},
+        }
+    }
+    return true;
+}
+
+fn validateElementName(name: []const u8) !void {
+    if (!isValidElementLocalName(name)) {
+        return error.InvalidCharacterError;
+    }
+}
+
+pub const ValidatedName = struct {
+    prefix: ?[]const u8,
+    local_name: []const u8,
+    namespace: ?[]const u8,
+};
+
+// The DOM spec's "validate and extract a namespace and qualifiedName".
+pub fn validateAndExtract(namespace_: ?[]const u8, qualified_name: []const u8, comptime context: enum { element, attribute }) !ValidatedName {
+    var namespace: ?[]const u8 = namespace_;
+    if (namespace) |ns| {
+        if (ns.len == 0) {
+            namespace = null;
+        }
+    }
+
+    var prefix: ?[]const u8 = null;
+    var local_name = qualified_name;
+    if (std.mem.indexOfScalar(u8, qualified_name, ':')) |colon| {
+        prefix = qualified_name[0..colon];
+        local_name = qualified_name[colon + 1 ..];
+        if (!isValidNamespacePrefix(prefix.?)) {
             return error.InvalidCharacterError;
         }
     }
+
+    const local_valid = switch (context) {
+        .element => isValidElementLocalName(local_name),
+        .attribute => isValidAttributeLocalName(local_name),
+    };
+    if (!local_valid) {
+        return error.InvalidCharacterError;
+    }
+
+    if (prefix != null and namespace == null) {
+        return error.NamespaceError;
+    }
+    if (prefix) |p| {
+        if (std.mem.eql(u8, p, "xml") and (namespace == null or !std.mem.eql(u8, namespace.?, "http://www.w3.org/XML/1998/namespace"))) {
+            return error.NamespaceError;
+        }
+    }
+    const is_xmlns = std.mem.eql(u8, qualified_name, "xmlns") or (prefix != null and std.mem.eql(u8, prefix.?, "xmlns"));
+    const ns_is_xmlns = namespace != null and std.mem.eql(u8, namespace.?, "http://www.w3.org/2000/xmlns/");
+    if (is_xmlns != ns_is_xmlns) {
+        return error.NamespaceError;
+    }
+
+    return .{ .prefix = prefix, .local_name = local_name, .namespace = namespace };
 }
 
 // When a frame's URL is about:blank, or as soon as a frame is
@@ -1265,6 +1408,7 @@ pub const JsApi = struct {
     }
 
     pub const onselectionchange = bridge.accessor(Document.getOnSelectionChange, Document.setOnSelectionChange, .{});
+    pub const onclick = bridge.accessor(Document.getOnClick, Document.setOnClick, .{});
     pub const URL = bridge.accessor(Document.getURL, null, .{});
     pub const location = bridge.accessor(Document.getLocation, Document.setLocation, .{});
     pub const documentURI = bridge.accessor(Document.getURL, null, .{});

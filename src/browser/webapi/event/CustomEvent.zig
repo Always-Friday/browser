@@ -66,8 +66,14 @@ pub fn initCustomEvent(
     cancelable: ?bool,
     detail_: ?js.Value.Global,
 ) !void {
+    // Like initEvent, a no-op while the event is being dispatched.
+    if (self._proto._event_phase != .none) {
+        return;
+    }
+
     // This function can only be called after the constructor has called.
     // So we assume proto is initialized already by constructor.
+    self._proto._initialized = true;
     self._proto._type_string = try String.init(self._proto._arena, event_string, .{});
     self._proto._bubbles = bubbles orelse false;
     self._proto._cancelable = cancelable orelse false;

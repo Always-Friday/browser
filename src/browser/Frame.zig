@@ -134,6 +134,7 @@ _element_computed_styles: Element.StyleLookup = .empty,
 _element_datasets: Element.DatasetLookup = .empty,
 _element_class_lists: Element.ClassListLookup = .empty,
 _element_rel_lists: Element.RelListLookup = .empty,
+_element_token_lists: Element.TokenListLookup = .empty,
 _element_shadow_roots: Element.ShadowRootLookup = .empty,
 _node_owner_documents: Node.OwnerDocumentLookup = .empty,
 _element_scroll_positions: Element.ScrollPositionLookup = .empty,
@@ -1843,6 +1844,7 @@ pub fn openPopup(self: *Frame, opts: OpenPopupOpts) !*Frame {
     errdefer popup.deinit();
 
     popup.window._opener = opts.opener;
+
     if (opts.name.len > 0 and
         !std.ascii.eqlIgnoreCase(opts.name, "_blank") and
         !std.ascii.eqlIgnoreCase(opts.name, "_self") and
@@ -1861,6 +1863,13 @@ pub fn openPopup(self: *Frame, opts: OpenPopupOpts) !*Frame {
         log.warn(.frame, "popup navigate failure", .{ .url = resolved_url, .err = err });
         return err;
     };
+
+    // A bit hacky. The type of window we return depends on whether or not its
+    // origin is the same as the opener. I believe that we're supposed to do
+    // this check lazily, per function invocation. But we don't have that in
+    // place right now. So the best we can do is set the origin now, before the
+    // async navigation completed.
+    try popup.js.setOrigin(popup.origin);
 
     return popup;
 }
@@ -3142,6 +3151,11 @@ const SubmitFormOpts = struct {
 };
 pub fn submitForm(self: *Frame, submitter_: ?*Element, form_: ?*Element.Html.Form, submit_opts: SubmitFormOpts) !void {
     const form = form_ orelse return;
+
+    if (submit_opts.fire_event and form.asNode().isConnected() == false) {
+        // interactive submission (e.g. submit button) noop if the form is disconnected
+        return;
+    }
 
     // see the `_constructing_entry_list` field documentation
     if (form._constructing_entry_list) {
