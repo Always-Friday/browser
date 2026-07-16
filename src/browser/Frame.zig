@@ -51,6 +51,7 @@ const Performance = @import("webapi/Performance.zig");
 const Screen = @import("webapi/Screen.zig");
 const VisualViewport = @import("webapi/VisualViewport.zig");
 const AbstractRange = @import("webapi/AbstractRange.zig");
+const DOMNodeIterator = @import("webapi/DOMNodeIterator.zig");
 const Worker = @import("webapi/Worker.zig");
 const CSSStyleSheet = @import("webapi/css/CSSStyleSheet.zig");
 const CustomElementDefinition = @import("webapi/CustomElementDefinition.zig");
@@ -189,6 +190,9 @@ _http_owner: HttpClient.Owner = .{},
 
 // List of active live ranges (for mutation updates per DOM spec)
 _live_ranges: std.DoublyLinkedList = .{},
+// Live NodeIterators for the DOM pre-removing steps. Iterators are
+// slab-allocated (frame lifetime) and never unlinked.
+_live_node_iterators: std.DoublyLinkedList = .{},
 
 // List of open BroadcastChannels, used to route postMessage between same-named
 // channels in this frame's origin
@@ -670,8 +674,11 @@ pub fn navigate(self: *Frame, request_url: [:0]const u8, opts: NavigateOpts) !vo
             };
             const parse_arena = try self.getArena(.medium, "Frame.parseBlob");
             defer self.releaseArena(parse_arena);
+            // A script executed mid-parse can revoke the blob URL, letting GC
+            // free the buffer under the parser; parse a copy.
+            const html = try parse_arena.dupe(u8, blob._slice);
             var parser = Parser.init(parse_arena, self.document.asNode(), self, .{ .allow_declarative_shadow = true });
-            parser.parse(blob._slice);
+            parser.parse(html);
         } else {
             self.document.injectBlank(self) catch |err| {
                 log.err(.browser, "inject blank", .{ .err = err });
@@ -2372,8 +2379,19 @@ pub fn dupeSSO(self: *Frame, value: []const u8) !String {
 
 const RemoveNodeOpts = struct {
     will_be_reconnected: bool,
+    // Set to false when the caller queues its own combined mutation record
+    notify_observers: bool = true,
 };
 pub fn removeNode(self: *Frame, parent: *Node, child: *Node, opts: RemoveNodeOpts) void {
+    // NodeIterator pre-removing steps must run while the tree is intact.
+    if (self._live_node_iterators.first != null) {
+        var it: ?*std.DoublyLinkedList.Node = self._live_node_iterators.first;
+        while (it) |link| : (it = link.next) {
+            const iterator: *DOMNodeIterator = @fieldParentPtr("_iterator_link", link);
+            iterator.nodeWillBeRemoved(child);
+        }
+    }
+
     // Capture siblings before removing
     const previous_sibling = child.previousSibling();
     const next_sibling = child.nextSibling();
@@ -2406,7 +2424,7 @@ pub fn removeNode(self: *Frame, parent: *Node, child: *Node, opts: RemoveNodeOpt
 
     slotting.removalSteps(parent, child, self);
 
-    if (observers.hasMutationObservers(self)) {
+    if (opts.notify_observers and observers.hasMutationObservers(self)) {
         const removed = [_]*Node{child};
         observers.notifyChildListChange(self, parent, &.{}, &removed, previous_sibling, next_sibling);
     }
@@ -2469,31 +2487,54 @@ pub fn appendNode(self: *Frame, parent: *Node, child: *Node, opts: InsertNodeOpt
 }
 
 pub fn appendAllChildren(self: *Frame, parent: *Node, target: *Node) !void {
-    self.domChanged();
-    const dest_connected = target.isConnected();
-
-    var it = parent.childrenIterator();
-    while (it.next()) |child| {
-        const child_was_connected = child.isConnected();
-        self.removeNode(parent, child, .{ .will_be_reconnected = dest_connected });
-        try self.appendNode(target, child, .{ .child_already_connected = child_was_connected });
-    }
+    return self.moveAllChildren(parent, target, null, .records);
 }
 
 pub fn insertAllChildrenBefore(self: *Frame, fragment: *Node, parent: *Node, ref_node: *Node) !void {
+    return self.moveAllChildren(fragment, parent, ref_node, .records);
+}
+
+pub const MoveChildrenNotify = enum { records, silent_parent };
+
+// Moves every child of `source` into `parent` (before `ref_node`, or
+// appended). Per the DOM insert algorithm for fragments, observers get one
+// removal record on the source and one addition record on the parent, not
+// one record per child. `.silent_parent` suppresses only the parent record
+// (replaceChild queues its own combined record); the source record is queued
+// regardless — the spec's insert algorithm notes it "intentionally does not
+// pay attention to suppressObservers".
+pub fn moveAllChildren(self: *Frame, source: *Node, parent: *Node, ref_node: ?*Node, notify_mode: MoveChildrenNotify) !void {
     self.domChanged();
     const dest_connected = parent.isConnected();
+    const notify = observers.hasMutationObservers(self);
 
-    var it = fragment.childrenIterator();
+    var moved: std.ArrayList(*Node) = .empty;
+    const previous_sibling = if (ref_node) |ref| ref.previousSibling() else parent.lastChild();
+
+    var it = source.childrenIterator();
     while (it.next()) |child| {
+        if (notify) {
+            try moved.append(self.call_arena, child);
+        }
         const child_was_connected = child.isConnected();
-        self.removeNode(fragment, child, .{ .will_be_reconnected = dest_connected });
-        try self.insertNodeRelative(
-            parent,
-            child,
-            .{ .before = ref_node },
-            .{ .child_already_connected = child_was_connected },
-        );
+        self.removeNode(source, child, .{ .will_be_reconnected = dest_connected, .notify_observers = false });
+        if (ref_node) |ref| {
+            try self.insertNodeRelative(
+                parent,
+                child,
+                .{ .before = ref },
+                .{ .child_already_connected = child_was_connected, .notify_observers = false },
+            );
+        } else {
+            try self.appendNode(parent, child, .{ .child_already_connected = child_was_connected, .notify_observers = false });
+        }
+    }
+
+    if (notify and moved.items.len > 0) {
+        observers.notifyChildListChange(self, source, &.{}, moved.items, null, null);
+        if (notify_mode == .records) {
+            observers.notifyChildListChange(self, parent, moved.items, &.{}, previous_sibling, ref_node);
+        }
     }
 }
 
@@ -2505,6 +2546,8 @@ const InsertNodeRelative = union(enum) {
 const InsertNodeOpts = struct {
     child_already_connected: bool = false,
     adopting_to_new_document: bool = false,
+    // Set to false when the caller queues its own combined mutation record
+    notify_observers: bool = true,
 };
 pub fn insertNodeRelative(self: *Frame, parent: *Node, child: *Node, relative: InsertNodeRelative, opts: InsertNodeOpts) !void {
     return self._insertNodeRelative(false, parent, child, relative, opts);
@@ -2560,12 +2603,14 @@ pub fn _insertNodeRelative(self: *Frame, comptime from_parser: bool, parent: *No
         }
     }
 
-    // The parser path does its own (limited) notification and connected-callback
-    // work, then returns.
+    // The parser path does its own (limited) notification and
+    // connected-callback work, then returns.
     if (comptime from_parser) {
-        // Of the parser insertions, only fragment parses (innerHTML) mutate a
-        // live tree; the initial document parse suppresses notifications.
-        if (self._parse_mode == .fragment) {
+        // Main-document parser insertions notify per node: scripts running
+        // during parsing can observe the document. Fragment parses
+        // (innerHTML et al.) stay silent; Node.setHTML queues one combined
+        // "replace all" record instead.
+        if (self._parse_mode != .fragment) {
             self.notifyChildInserted(parent, child);
         }
 
@@ -2598,7 +2643,9 @@ pub fn _insertNodeRelative(self: *Frame, comptime from_parser: bool, parent: *No
         }
     }
 
-    self.notifyChildInserted(parent, child);
+    if (opts.notify_observers) {
+        self.notifyChildInserted(parent, child);
+    }
 
     if (opts.child_already_connected and !opts.adopting_to_new_document) {
         // The child is already connected in the same document, we don't have to reconnect it.
@@ -2821,21 +2868,11 @@ fn parseHtmlAsChildrenInner(self: *Frame, node: *Node, html: []const u8, opts: F
     }
     node._children = first._children;
 
-    if (observers.hasMutationObservers(self)) {
-        var it = node.childrenIterator();
-        while (it.next()) |child| {
-            child._parent = node;
-            // Notify mutation observers for each unwrapped child
-            const previous_sibling = child.previousSibling();
-            const next_sibling = child.nextSibling();
-            const added = [_]*Node{child};
-            observers.notifyChildListChange(self, node, &added, &.{}, previous_sibling, next_sibling);
-        }
-    } else {
-        var it = node.childrenIterator();
-        while (it.next()) |child| {
-            child._parent = node;
-        }
+    // No mutation records for the unwrapped children either; see the comment
+    // about fragment parses in _insertNodeRelative.
+    var it = node.childrenIterator();
+    while (it.next()) |child| {
+        child._parent = node;
     }
 }
 
