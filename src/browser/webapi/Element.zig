@@ -56,6 +56,9 @@ pub const NamespaceUriLookup = std.AutoHashMapUnmanaged(*Element, []const u8);
 pub const ScrollPosition = struct {
     x: u32 = 0,
     y: u32 = 0,
+    // Throttle state for the async scroll/scrollend dispatch (mirrors
+    // Window._scroll_pos.state).
+    state: enum { scroll, end, done } = .done,
 };
 pub const ScrollPositionLookup = std.AutoHashMapUnmanaged(*Element, ScrollPosition);
 
@@ -1024,6 +1027,12 @@ pub fn focus(self: *Element, frame: *Frame) !void {
         return;
     }
 
+    // Per HTML spec §6.4.4, an element must be "being rendered" (not
+    // display:none on self or any ancestor) to be focusable.
+    if (!self.checkVisibilityCached(null, frame)) {
+        return;
+    }
+
     const FocusEvent = @import("event/FocusEvent.zig");
 
     const new_target = self.asEventTarget();
@@ -1081,21 +1090,11 @@ pub fn getChildren(self: *Element, frame: *Frame) !collections.NodeLive(.child_e
 }
 
 pub fn append(self: *Element, nodes: []const Node.NodeOrText, frame: *Frame) !void {
-    const parent = self.asNode();
-    for (nodes) |node_or_text| {
-        const child = try node_or_text.toNode(frame);
-        _ = try parent.appendChild(child, frame);
-    }
+    return self.asNode().appendNodes(nodes, frame);
 }
 
 pub fn prepend(self: *Element, nodes: []const Node.NodeOrText, frame: *Frame) !void {
-    const parent = self.asNode();
-    var i = nodes.len;
-    while (i > 0) {
-        i -= 1;
-        const child = try nodes[i].toNode(frame);
-        _ = try parent.insertBefore(child, parent.firstChild(), frame);
-    }
+    return self.asNode().prependNodes(nodes, frame);
 }
 
 pub fn moveBefore(self: *Element, node: js.Value, child: js.Value, frame: *Frame) !void {
@@ -1252,8 +1251,8 @@ pub fn getElementDimensions(self: *Element, frame: *Frame) struct { width: f64, 
 
     if (self.getStyle(frame)) |style| {
         const decl = style.asCSSStyleDeclaration();
-        width = CSS.parseDimension(decl.getPropertyValue("width", frame)) orelse 5.0;
-        height = CSS.parseDimension(decl.getPropertyValue("height", frame)) orelse 5.0;
+        width = CSS.parseDimensionViewport(decl.getPropertyValue("width", frame), frame) orelse 5.0;
+        height = CSS.parseDimensionViewport(decl.getPropertyValue("height", frame), frame) orelse 5.0;
     }
 
     if (width == 5.0 or height == 5.0) {
@@ -1334,30 +1333,47 @@ pub fn getClientRects(self: *Element, frame: *Frame) ![]*DOMRect {
     return rects;
 }
 
+// Scroll positions live in the map of the element's own frame — not the
+// caller's, which differs when a same-origin script scrolls an element in
+// another frame (e.g. inside an iframe). All scroll accessors resolve the
+// owner frame first so the state, the fired events and the document
+// comparison stay in the element's frame.
 pub fn getScrollTop(self: *Element, frame: *Frame) u32 {
-    const pos = frame._element_scroll_positions.get(self) orelse return 0;
+    const owner = self.ownerFrame(frame);
+    const pos = owner._element_scroll_positions.get(self) orelse return 0;
     return pos.y;
 }
 
 pub fn setScrollTop(self: *Element, value: i32, frame: *Frame) !void {
-    const gop = try frame._element_scroll_positions.getOrPut(frame.arena, self);
+    const owner = self.ownerFrame(frame);
+    const gop = try owner._element_scroll_positions.getOrPut(owner.arena, self);
     if (!gop.found_existing) {
         gop.value_ptr.* = .{};
     }
-    gop.value_ptr.y = @intCast(@max(0, value));
+    const new_y: u32 = @intCast(@max(0, value));
+    if (gop.value_ptr.y != new_y) {
+        gop.value_ptr.y = new_y;
+        try self.scheduleScrollEvents(owner);
+    }
 }
 
 pub fn getScrollLeft(self: *Element, frame: *Frame) u32 {
-    const pos = frame._element_scroll_positions.get(self) orelse return 0;
+    const owner = self.ownerFrame(frame);
+    const pos = owner._element_scroll_positions.get(self) orelse return 0;
     return pos.x;
 }
 
 pub fn setScrollLeft(self: *Element, value: i32, frame: *Frame) !void {
-    const gop = try frame._element_scroll_positions.getOrPut(frame.arena, self);
+    const owner = self.ownerFrame(frame);
+    const gop = try owner._element_scroll_positions.getOrPut(owner.arena, self);
     if (!gop.found_existing) {
         gop.value_ptr.* = .{};
     }
-    gop.value_ptr.x = @intCast(@max(0, value));
+    const new_x: u32 = @intCast(@max(0, value));
+    if (gop.value_ptr.x != new_x) {
+        gop.value_ptr.x = new_x;
+        try self.scheduleScrollEvents(owner);
+    }
 }
 
 pub fn getScrollHeight(self: *Element, frame: *Frame) f64 {
@@ -1643,10 +1659,13 @@ const ScrollToOpts = union(enum) {
 
 pub fn scrollTo(self: *Element, opts: ?ScrollToOpts, y: ?i32, frame: *Frame) !void {
     const o = opts orelse return;
-    const gop = try frame._element_scroll_positions.getOrPut(frame.arena, self);
+    const owner = self.ownerFrame(frame);
+    const gop = try owner._element_scroll_positions.getOrPut(owner.arena, self);
     if (!gop.found_existing) {
         gop.value_ptr.* = .{};
     }
+    const old_x = gop.value_ptr.x;
+    const old_y = gop.value_ptr.y;
     switch (o) {
         .x => |x| {
             gop.value_ptr.x = @intCast(@max(0, x));
@@ -1657,12 +1676,16 @@ pub fn scrollTo(self: *Element, opts: ?ScrollToOpts, y: ?i32, frame: *Frame) !vo
             if (dict.top) |top| gop.value_ptr.y = @intCast(@max(0, top));
         },
     }
+    if (gop.value_ptr.x != old_x or gop.value_ptr.y != old_y) {
+        try self.scheduleScrollEvents(owner);
+    }
 }
 
 // scrollBy(): like scrollTo() but relative to the current position.
 pub fn scrollBy(self: *Element, opts: ?ScrollToOpts, y: ?i32, frame: *Frame) !void {
     const o = opts orelse return;
-    const gop = try frame._element_scroll_positions.getOrPut(frame.arena, self);
+    const owner = self.ownerFrame(frame);
+    const gop = try owner._element_scroll_positions.getOrPut(owner.arena, self);
     if (!gop.found_existing) {
         gop.value_ptr.* = .{};
     }
@@ -1670,9 +1693,104 @@ pub fn scrollBy(self: *Element, opts: ?ScrollToOpts, y: ?i32, frame: *Frame) !vo
         .x => |x| .{ x, y orelse 0 },
         .opts => |dict| .{ dict.left orelse 0, dict.top orelse 0 },
     };
+    const old_x = gop.value_ptr.x;
+    const old_y = gop.value_ptr.y;
     gop.value_ptr.x = @intCast(@max(0, @as(i32, @intCast(gop.value_ptr.x)) + dx));
     gop.value_ptr.y = @intCast(@max(0, @as(i32, @intCast(gop.value_ptr.y)) + dy));
+    if (gop.value_ptr.x != old_x or gop.value_ptr.y != old_y) {
+        try self.scheduleScrollEvents(owner);
+    }
 }
+
+// Scrolling an element fires a scroll event and then a scrollend event,
+// asynchronously and throttled, mirroring Window.scrollTo. Scrolls of the
+// scrolling element (the root) are fired at the document instead.
+// `frame` is the element's owner frame (resolved by the public accessors).
+fn scheduleScrollEvents(self: *Element, frame: *Frame) !void {
+    const gop = try frame._element_scroll_positions.getOrPut(frame.arena, self);
+    if (!gop.found_existing) {
+        gop.value_ptr.* = .{};
+    }
+    const task_pending = gop.value_ptr.state != .done;
+    gop.value_ptr.state = .scroll;
+    if (task_pending) {
+        return;
+    }
+
+    const task = try frame._factory.create(ScrollEventTask{ .frame = frame, .element = self });
+    errdefer {
+        gop.value_ptr.state = .done;
+        frame._factory.destroy(task);
+    }
+    try frame.js.scheduler.add(task, ScrollEventTask.run, 10, .{
+        .name = "element.scrollEvents",
+        .low_priority = true,
+        .finalizer = ScrollEventTask.cancelled,
+    });
+}
+
+const ScrollEventTask = struct {
+    frame: *Frame,
+    element: *Element,
+
+    fn eventTarget(self: *ScrollEventTask) *@import("EventTarget.zig") {
+        if (self.frame.document.getDocumentElement() == self.element) {
+            return self.frame.document.asEventTarget();
+        }
+        return self.element.asEventTarget();
+    }
+
+    // Scroll events fired at an element don't bubble; only document-level
+    // scrolls (the scrolling element, dispatched at the document) do.
+    fn bubbles(self: *ScrollEventTask) bool {
+        return self.frame.document.getDocumentElement() == self.element;
+    }
+
+    fn cancelled(ptr: *anyopaque) void {
+        const self: *ScrollEventTask = @ptrCast(@alignCast(ptr));
+        if (self.frame._element_scroll_positions.getPtr(self.element)) |pos| {
+            pos.state = .done;
+        }
+        self.frame._factory.destroy(self);
+    }
+
+    fn run(ptr: *anyopaque) anyerror!?u32 {
+        const self: *ScrollEventTask = @ptrCast(@alignCast(ptr));
+        const f = self.frame;
+        const pos = f._element_scroll_positions.getPtr(self.element) orelse {
+            f._factory.destroy(self);
+            return null;
+        };
+        switch (pos.state) {
+            .scroll => {
+                pos.state = .end;
+                self.dispatchEvent(comptime .wrap("scroll"));
+                return 10;
+            },
+            .end => {
+                pos.state = .done;
+                defer f._factory.destroy(self);
+                self.dispatchEvent(comptime .wrap("scrollend"));
+                return null;
+            },
+            .done => {
+                f._factory.destroy(self);
+                return null;
+            },
+        }
+    }
+
+    fn dispatchEvent(self: *ScrollEventTask, comptime event_type: String) void {
+        const Event = @import("Event.zig");
+        const event = Event.initTrusted(event_type, .{ .bubbles = self.bubbles() }, self.frame._page) catch |err| {
+            log.warn(.dom, "element.scroll.event", .{ .err = err });
+            return;
+        };
+        self.frame._event_manager.dispatch(self.eventTarget(), event) catch |err| {
+            log.warn(.dom, "element.scroll.dispatch", .{ .err = err });
+        };
+    }
+};
 
 pub fn format(self: *Element, writer: *std.Io.Writer) !void {
     try writer.writeByte('<');
