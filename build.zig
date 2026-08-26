@@ -68,8 +68,8 @@ pub fn build(b: *Build) !void {
         .cpu_arch = .x86_64,
         .os_tag = .linux,
         .abi = .gnu,
-        // https://codeberg.org/ziglang/zig/issues/31272
-        .glibc_version = .{ .major = 2, .minor = 43, .patch = 0 },
+        // Explicit version => bundled CRT, https://codeberg.org/ziglang/zig/issues/31272
+        .glibc_version = devFastGlibcVersion(b),
     }) else requested_target;
 
     // Without an explicit -Dprebuilt_v8_path, pick up whatever `make
@@ -77,9 +77,11 @@ pub fn build(b: *Build) !void {
     const prebuilt_v8_path = prebuilt_v8_path_option orelse if (enable_tsan or enable_asan) null else findPrebuiltV8(b, target, dev_fast);
     const snapshot_path = b.option([]const u8, "snapshot_path", "Path to v8 snapshot");
     const wpt_extensions = b.option(bool, "wpt_extensions", "Extend WebAPI with WPT driver behavior") orelse false;
-    const shared_v8 = b.option(bool, "shared_v8", "Link V8 as a shared library") orelse
-        (dev_fast or (prebuilt_v8_path != null and std.mem.endsWith(u8, prebuilt_v8_path.?, ".so")));
+    const shared_v8 = b.option(bool, "shared_v8", "Link V8 as a shared library") orelse (dev_fast or (prebuilt_v8_path != null and std.mem.endsWith(u8, prebuilt_v8_path.?, ".so")));
     const use_llvm = b.option(bool, "use_llvm", "Use the LLVM backend") orelse !dev_fast;
+    // Hot-code layout for the Linux release artifacts, see orderfile/README.md.
+    // Opt-in (CI passes it): it needs LLD and costs link time on every build.
+    const orderfile = b.option([]const u8, "orderfile", "Linker script packing hot sections, e.g. orderfile/lightpanda.ld (Linux/LLD release builds)");
 
     const version = resolveVersion(b);
     std.debug.print("Lightpanda {f}\n", .{version});
@@ -114,11 +116,11 @@ pub fn build(b: *Build) !void {
     b.default_step.dependOn(fmt_step);
 
     linkV8(b, lightpanda_module, enable_asan, enable_tsan, prebuilt_v8_path, shared_v8);
-    linkCurl(b, lightpanda_module, enable_tsan);
-    linkHtml5Ever(b, lightpanda_module);
+    linkCurl(b, lightpanda_module, enable_tsan, orderfile != null);
+    linkRust(b, lightpanda_module);
     linkZenai(b, lightpanda_module);
     linkIsocline(b, lightpanda_module);
-    linkSqlite(b, lightpanda_module, enable_csan, enable_tsan);
+    linkSqlite(b, lightpanda_module, enable_csan, enable_tsan, orderfile != null);
 
     // Check compilation
     const check = b.step("check", "Check if lightpanda compiles");
@@ -140,6 +142,7 @@ pub fn build(b: *Build) !void {
         .target = target,
         .optimize = optimize,
         .use_llvm = use_llvm,
+        .orderfile = orderfile,
         .sanitize_c = enable_csan,
         .sanitize_thread = enable_tsan,
     };
@@ -209,6 +212,7 @@ const ExeConfig = struct {
     target: Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     use_llvm: bool,
+    orderfile: ?[]const u8,
     sanitize_c: ?std.zig.SanitizeC,
     sanitize_thread: bool,
 };
@@ -229,6 +233,16 @@ fn addExe(b: *Build, config: ExeConfig, name: []const u8, check_name: []const u8
         }),
     });
 
+    if (config.orderfile) |path| {
+        // Per-function/per-datum sections exist only so the orderfile script
+        // can place individual hot functions; the self-hosted backend used by
+        // Debug builds does not support them on the C libraries, so they are
+        // gated on the orderfile being set (release/LLVM only).
+        exe.link_function_sections = true;
+        exe.link_data_sections = true;
+        exe.linker_script = .{ .cwd_relative = path };
+    }
+
     const exe_check = b.addLibrary(.{
         .name = check_name,
         .root_module = exe.root_module,
@@ -236,6 +250,12 @@ fn addExe(b: *Build, config: ExeConfig, name: []const u8, check_name: []const u8
     config.check.dependOn(&exe_check.step);
 
     return exe;
+}
+
+fn devFastGlibcVersion(b: *Build) std.SemanticVersion {
+    const host = b.graph.host.result.os.version_range.linux.glibc;
+    const newest_known: std.SemanticVersion = .{ .major = 2, .minor = 43, .patch = 0 };
+    return if (host.order(newest_known) == .gt) newest_known else host;
 }
 
 /// Looks for the prebuilt V8 that `make download-v8` caches. The cache
@@ -299,6 +319,18 @@ fn actionDefault(action: []const u8, key: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Per-function/per-datum sections let the -Dorderfile linker script place
+/// individual hot functions. Only enabled for orderfile (release/LLVM) builds:
+/// the self-hosted backend used by Debug builds fails to link the C libraries
+/// with them.
+fn sectionize(lib: *Build.Step.Compile, enabled: bool) *Build.Step.Compile {
+    if (enabled) {
+        lib.link_function_sections = true;
+        lib.link_data_sections = true;
+    }
+    return lib;
+}
+
 fn linkV8(
     b: *Build,
     mod: *Build.Module,
@@ -323,51 +355,65 @@ fn linkV8(
     mod.addImport("v8", dep.module("v8"));
 }
 
-fn linkHtml5Ever(b: *Build, mod: *Build.Module) void {
+fn linkRust(b: *Build, mod: *Build.Module) void {
     const is_debug = mod.optimize.? == .Debug;
 
+    // One cargo workspace, one staticlib (src/rust/Cargo.toml explains why).
     const exec_cargo = b.addSystemCommand(&.{
         "cargo",           "build",
         "--profile",       if (is_debug) "dev" else "release",
         "--features",      if (is_debug) "memstats" else "",
-        "--manifest-path", "src/html5ever/Cargo.toml",
+        "--manifest-path", "src/rust/ffi/Cargo.toml",
     });
 
-    // Track Rust sources so edits invalidate the cargo step's cache.
-    // Without this, Zig keys the step on argv only and won't re-run cargo
-    // when lib.rs/Cargo.toml change.
-    for ([_][]const u8{
-        "src/html5ever/Cargo.toml",
-        "src/html5ever/Cargo.lock",
-        "src/html5ever/lib.rs",
-        "src/html5ever/sink.rs",
-        "src/html5ever/types.rs",
-        "src/html5ever/url.rs",
-    }) |path| {
-        exec_cargo.addFileInput(b.path(path));
-    }
+    addDirInputs(b, exec_cargo, "src/rust", "target") catch |err| {
+        std.debug.panic("walk src/rust: {t}", .{err});
+    };
+
+    // Cargo reports progress on stderr; left uncaptured, Zig prints it as a
+    // "failed command: ..." diagnostic on a successful build. A non-zero exit
+    // still surfaces the captured output.
+    _ = exec_cargo.captureStdErr(.{});
 
     // don't let cargo's progress report (sent to stderr) cause Zig's build to
     // print a 'failed command: ...' message. (non-zero status still outputs the error)
     _ = exec_cargo.captureStdErr(.{});
 
     // TODO: We can prefer `--artifact-dir` once it become stable.
-    const out_dir = exec_cargo.addPrefixedOutputDirectoryArg("--target-dir=", "html5ever");
+    const out_dir = exec_cargo.addPrefixedOutputDirectoryArg("--target-dir=", "rust");
 
-    const html5ever_step = b.step("html5ever", "Install html5ever dependency (requires cargo)");
-    html5ever_step.dependOn(&exec_cargo.step);
+    const rust_step = b.step("rust", "Build the Rust staticlib (requires cargo)");
+    rust_step.dependOn(&exec_cargo.step);
 
-    const obj = out_dir.path(b, if (is_debug) "debug" else "release").path(b, "liblitefetch_html5ever.a");
+    const obj = out_dir.path(b, if (is_debug) "debug" else "release").path(b, "liblightpanda_ffi.a");
     mod.addObjectFile(obj);
 }
 
-fn linkSqlite(b: *Build, mod: *Build.Module, enable_csan: ?std.zig.SanitizeC, is_tsan: bool) void {
+/// Registers every file under `root` (relative to the build root) as an
+/// input of `run`, skipping the `skip_dir` subtree at any depth.
+fn addDirInputs(b: *Build, run: *Build.Step.Run, root: []const u8, skip_dir: []const u8) !void {
+    const io = b.graph.io;
+    var dir = try b.build_root.handle.openDir(io, root, .{ .iterate = true });
+    defer dir.close(io);
+
+    var walker = try dir.walk(b.allocator);
+    defer walker.deinit();
+    while (try walker.next(io)) |entry| {
+        switch (entry.kind) {
+            .directory => if (std.mem.eql(u8, entry.basename, skip_dir)) walker.leave(io),
+            .file => run.addFileInput(b.path(b.pathJoin(&.{ root, entry.path }))),
+            else => {},
+        }
+    }
+}
+
+fn linkSqlite(b: *Build, mod: *Build.Module, enable_csan: ?std.zig.SanitizeC, is_tsan: bool, section: bool) void {
     const dep = b.dependency("sqlite3", .{
         .target = mod.resolved_target.?,
         .optimize = mod.optimize.?,
     });
 
-    const lib = dep.artifact("sqlite3");
+    const lib = sectionize(dep.artifact("sqlite3"), section);
     lib.root_module.sanitize_c = enable_csan;
     lib.root_module.sanitize_thread = is_tsan;
 
@@ -419,10 +465,10 @@ fn linkSqlite(b: *Build, mod: *Build.Module, enable_csan: ?std.zig.SanitizeC, is
     mod.addImport("sqlite3", translate_c.createModule());
 }
 
-fn linkCurl(b: *Build, mod: *Build.Module, is_tsan: bool) void {
+fn linkCurl(b: *Build, mod: *Build.Module, is_tsan: bool, section: bool) void {
     const target = mod.resolved_target.?;
 
-    const curl = buildCurl(b, target, mod.optimize.?, is_tsan);
+    const curl = buildCurl(b, target, mod.optimize.?, is_tsan, section);
     mod.linkLibrary(curl);
 
     const dep = b.dependency("curl", .{});
@@ -434,16 +480,16 @@ fn linkCurl(b: *Build, mod: *Build.Module, is_tsan: bool) void {
     translate_c.addIncludePath(dep.path("include"));
     mod.addImport("curl", translate_c.createModule());
 
-    const zlib = buildZlib(b, target, mod.optimize.?, is_tsan);
+    const zlib = buildZlib(b, target, mod.optimize.?, is_tsan, section);
     curl.root_module.linkLibrary(zlib);
 
-    const brotli = buildBrotli(b, target, mod.optimize.?, is_tsan);
+    const brotli = buildBrotli(b, target, mod.optimize.?, is_tsan, section);
     for (brotli) |lib| curl.root_module.linkLibrary(lib);
 
-    const nghttp2 = buildNghttp2(b, target, mod.optimize.?, is_tsan);
+    const nghttp2 = buildNghttp2(b, target, mod.optimize.?, is_tsan, section);
     curl.root_module.linkLibrary(nghttp2);
 
-    const boringssl = buildBoringSsl(b, target, mod.optimize.?);
+    const boringssl = buildBoringSsl(b, target, mod.optimize.?, section);
     for (boringssl) |lib| curl.root_module.linkLibrary(lib);
 
     if (target.result.os.tag == .macos) {
@@ -463,11 +509,11 @@ fn cLibModule(b: *Build, target: Build.ResolvedTarget, optimize: std.builtin.Opt
     });
 }
 
-fn buildZlib(b: *Build, target: Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, is_tsan: bool) *Build.Step.Compile {
+fn buildZlib(b: *Build, target: Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, is_tsan: bool, section: bool) *Build.Step.Compile {
     const dep = b.dependency("zlib", .{});
 
     const mod = cLibModule(b, target, optimize, is_tsan);
-    const lib = b.addLibrary(.{ .name = "z", .root_module = mod });
+    const lib = sectionize(b.addLibrary(.{ .name = "z", .root_module = mod }), section);
     lib.installHeadersDirectory(dep.path(""), "", .{});
     mod.addCSourceFiles(.{
         .root = dep.path(""),
@@ -489,15 +535,15 @@ fn buildZlib(b: *Build, target: Build.ResolvedTarget, optimize: std.builtin.Opti
     return lib;
 }
 
-fn buildBrotli(b: *Build, target: Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, is_tsan: bool) [3]*Build.Step.Compile {
+fn buildBrotli(b: *Build, target: Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, is_tsan: bool, section: bool) [3]*Build.Step.Compile {
     const dep = b.dependency("brotli", .{});
 
     const mod = cLibModule(b, target, optimize, is_tsan);
     mod.addIncludePath(dep.path("c/include"));
 
-    const brotlicmn = b.addLibrary(.{ .name = "brotlicommon", .root_module = mod });
-    const brotlidec = b.addLibrary(.{ .name = "brotlidec", .root_module = mod });
-    const brotlienc = b.addLibrary(.{ .name = "brotlienc", .root_module = mod });
+    const brotlicmn = sectionize(b.addLibrary(.{ .name = "brotlicommon", .root_module = mod }), section);
+    const brotlidec = sectionize(b.addLibrary(.{ .name = "brotlidec", .root_module = mod }), section);
+    const brotlienc = sectionize(b.addLibrary(.{ .name = "brotlienc", .root_module = mod }), section);
 
     brotlicmn.installHeadersDirectory(dep.path("c/include/brotli"), "brotli", .{});
     mod.addCSourceFiles(.{
@@ -531,23 +577,23 @@ fn buildBrotli(b: *Build, target: Build.ResolvedTarget, optimize: std.builtin.Op
     return .{ brotlicmn, brotlidec, brotlienc };
 }
 
-fn buildBoringSsl(b: *Build, target: Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) [2]*Build.Step.Compile {
+fn buildBoringSsl(b: *Build, target: Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, section: bool) [2]*Build.Step.Compile {
     const dep = b.dependency("boringssl-zig", .{
         .target = target,
         .optimize = optimize,
         .force_pic = true,
     });
 
-    const ssl = dep.artifact("ssl");
+    const ssl = sectionize(dep.artifact("ssl"), section);
     ssl.bundle_ubsan_rt = false;
 
-    const crypto = dep.artifact("crypto");
+    const crypto = sectionize(dep.artifact("crypto"), section);
     crypto.bundle_ubsan_rt = false;
 
     return .{ ssl, crypto };
 }
 
-fn buildNghttp2(b: *Build, target: Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, is_tsan: bool) *Build.Step.Compile {
+fn buildNghttp2(b: *Build, target: Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, is_tsan: bool, section: bool) *Build.Step.Compile {
     const dep = b.dependency("nghttp2", .{});
 
     const mod = cLibModule(b, target, optimize, is_tsan);
@@ -562,7 +608,7 @@ fn buildNghttp2(b: *Build, target: Build.ResolvedTarget, optimize: std.builtin.O
     });
     mod.addConfigHeader(config);
 
-    const lib = b.addLibrary(.{ .name = "nghttp2", .root_module = mod });
+    const lib = sectionize(b.addLibrary(.{ .name = "nghttp2", .root_module = mod }), section);
 
     lib.installConfigHeader(config);
     lib.installHeadersDirectory(dep.path("lib/includes/nghttp2"), "nghttp2", .{});
@@ -595,6 +641,7 @@ fn buildCurl(
     target: Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     is_tsan: bool,
+    section: bool,
 ) *Build.Step.Compile {
     const dep = b.dependency("curl", .{});
 
@@ -841,7 +888,7 @@ fn buildCurl(
     });
     curl_config.addValues(config);
 
-    const lib = b.addLibrary(.{ .name = "curl", .root_module = mod });
+    const lib = sectionize(b.addLibrary(.{ .name = "curl", .root_module = mod }), section);
     mod.addConfigHeader(curl_config);
     lib.installHeadersDirectory(dep.path("include/curl"), "curl", .{});
     mod.addCSourceFiles(.{

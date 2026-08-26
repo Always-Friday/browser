@@ -295,7 +295,7 @@ pub fn classifyInteractivity(
     }
 
     // 2. ARIA interactive role
-    if (el.getAttributeSafe(comptime .wrap("role"))) |role| {
+    if (explicitRole(el)) |role| {
         if (isInteractiveRole(role)) return .aria;
     }
 
@@ -367,9 +367,15 @@ pub fn isContentRole(role: []const u8) bool {
     return content_roles.has(lowered);
 }
 
+// ARIA `role` is a space-separated fallback list; the first token wins.
+pub fn explicitRole(el: *Element) ?[]const u8 {
+    const attr = el.getAttributeSafe(comptime .wrap("role")) orelse return null;
+    var it = std.mem.tokenizeAny(u8, attr, " \t\n\r");
+    return it.next();
+}
+
 fn getRole(el: *Element) ?[]const u8 {
-    // Explicit role attribute takes precedence
-    if (el.getAttributeSafe(comptime .wrap("role"))) |role| return role;
+    if (explicitRole(el)) |role| return role;
 
     // Implicit role from tag
     return switch (el.getTag()) {
@@ -563,6 +569,23 @@ test "browser.interactive: aria role" {
     try testing.expectEqual(InteractivityType.aria, elements[0].interactivity_type);
 }
 
+test "browser.interactive: aria role token list" {
+    const elements = try testInteractive(
+        \\<div role="switch checkbox">Fallback</div>
+        \\<div role=" button ">Padded</div>
+        \\<div role="">Empty</div>
+        \\<button role="  ">Blank</button>
+    );
+    defer testing.test_session.closeAllPages();
+    try testing.expectEqual(3, elements.len);
+    try testing.expectEqual("switch", elements[0].role.?);
+    try testing.expectEqual(InteractivityType.aria, elements[0].interactivity_type);
+    try testing.expectEqual("button", elements[1].role.?);
+    try testing.expectEqual(InteractivityType.aria, elements[1].interactivity_type);
+    try testing.expectEqual("button", elements[2].tag_name);
+    try testing.expectEqual("button", elements[2].role.?);
+}
+
 test "browser.interactive: contenteditable" {
     const elements = try testInteractive("<div contenteditable=\"true\">Edit me</div>");
     defer testing.test_session.closeAllPages();
@@ -602,6 +625,12 @@ test "browser.interactive: disabled by fieldset" {
 
 test "browser.interactive: pointer-events none" {
     const elements = try testInteractive("<button style=\"pointer-events: none;\">Click me</button>");
+    defer testing.test_session.closeAllPages();
+    try testing.expectEqual(0, elements.len);
+}
+
+test "browser.interactive: pointer-events none is case-insensitive" {
+    const elements = try testInteractive("<button style=\"pointer-events: NONE;\">Click me</button>");
     defer testing.test_session.closeAllPages();
     try testing.expectEqual(0, elements.len);
 }

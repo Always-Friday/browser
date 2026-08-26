@@ -24,9 +24,11 @@ const log = lp.log;
 const tavily = zenai.search.tavily;
 const brave = zenai.search.brave;
 const exa = zenai.search.exa;
+const keenable = zenai.search.keenable;
 
 const DOMNode = @import("webapi/Node.zig");
 const CDPNode = @import("../cdp/Node.zig");
+const LimitedWriter = @import("../LimitedWriter.zig");
 const Selector = @import("webapi/selector/Selector.zig");
 
 /// Conventions any LLM driving Lightpanda should follow. The standalone
@@ -37,8 +39,9 @@ const Selector = @import("webapi/selector/Selector.zig");
 /// correctly" — most importantly the selector rule that keeps sessions
 /// recordable as JavaScript agent scripts.
 pub const driver_guidance =
-    \\You are driving Lightpanda — a text-only headless browser. You reason
-    \\over pages through tools; there is no rendering, no images, no PDFs.
+    \\You are driving Lightpanda, a headless browser, through text tools:
+    \\no screenshots, no images, no PDFs — you reason over pages as a
+    \\semantic tree, markdown or HTML.
     \\
     \\Reading pages (cheap → expensive — prefer cheaper):
     \\- `tree` → semantic overview (role, name, value, backendNodeId per
@@ -350,7 +353,7 @@ pub const Tool = enum {
                 ),
             },
             .search => .{
-                .description = "Run a web search and return results as markdown. When BRAVE_API_KEY, TAVILY_API_KEY or EXA_API_KEY is set, queries that search API (in that preference order) and returns a numbered list of {title, url, snippet}. Otherwise (or on API failure) falls back to scraping the DuckDuckGo HTML endpoint — degraded results, may rate-limit on bursty traffic. Prefer this over goto-ing google.com/search directly (Google blocks the browser on User-Agent/TLS). Browser state after this call is unspecified — to interact with a result, use `goto` with its URL; do not assume the browser DOM matches the results page.",
+                .description = "Run a web search and return results as markdown: a numbered list of {title, url, snippet}. Search " ++ search_cascade_prose ++ ". Prefer this over goto-ing google.com/search directly (Google blocks the browser on User-Agent/TLS). The browser does not navigate — to open a result, use `goto` with its URL.",
                 .summary = "Web search, results as markdown",
                 .input_schema = minify(
                     \\{
@@ -388,6 +391,8 @@ pub const Tool = enum {
                     \\  "properties": {
                     \\    "selector": { "type": "string", "description": "Optional CSS selector. When set, dump only that element's outerHTML." },
                     \\    "backendNodeId": { "type": "integer", "description": "Optional backend node ID. When set, dump only that node's outerHTML. 0 is treated as omitted." },
+                    \\    "maxBytes": { "type": "integer", "description": "Optional soft cap on output size in bytes. Content is truncated at a UTF-8 boundary and a short '[truncated]' marker is appended past the cap." },
+                    \\    "strip": { "type": "object", "description": "Optional. Omit element groups from the output: `js` (script, noscript, script preloads), `css` (style, stylesheet links), `ui` (css plus img, picture, video, audio, svg, canvas, iframe), `invisible` (elements an author rule or inline style sets to display:none). {\"js\":true,\"css\":true} keeps a page dump small.", "properties": { "js": { "type": "boolean" }, "css": { "type": "boolean" }, "ui": { "type": "boolean" }, "invisible": { "type": "boolean" } } },
                     \\    "url": { "type": "string", "description": "Optional URL to navigate to before dumping." },
                     \\    "timeout": { "type": "integer", "description": "Optional timeout in milliseconds. Defaults to 10000." }
                     \\  }
@@ -846,7 +851,7 @@ fn dispatch(
 ) ToolError!ToolResult {
     return switch (tool) {
         .goto => .{ .text = try execGoto(arena, session, registry, substituted) },
-        .search => execSearch(arena, session, registry, substituted),
+        .search => execSearch(arena, substituted),
         .markdown => .{ .text = try execMarkdown(arena, session, registry, substituted) },
         .html => .{ .text = try execHtml(arena, session, registry, substituted) },
         .links => .{ .text = try execLinks(arena, session, registry, substituted) },
@@ -978,20 +983,21 @@ pub const SearchParams = struct {
     timeout: ?u32 = null,
 };
 
-/// Search backend for `execSearch`. `.auto` tries the `api_engines` in
-/// order (each only when its API key is set), then the DuckDuckGo scrape;
-/// an explicit engine is used alone. Only the agent REPL's `/searchEngine`
-/// mutates this.
-pub const SearchEngine = enum { auto, tavily, brave, exa, duckduckgo };
+/// Advertised by the `search` schema. The search clients have no connect
+/// timeout, so this only starts once connected.
+const default_search_timeout_ms: u32 = 10_000;
+
+pub const SearchEngine = enum { auto, brave, tavily, exa, keenable };
+/// Only the agent REPL's `/searchEngine` mutates this.
 pub var search_engine: SearchEngine = .auto;
 
-// Ordered by `.auto` preference; the `search` tool description prose must
-// agree with this table.
+// In `.auto` preference order.
 const api_engines = .{
     .{
         .tag = SearchEngine.brave,
         .env_var = "BRAVE_API_KEY",
         .Client = brave.Client,
+        .init_options = brave.Client.InitOptions{},
         // text_decorations=false: no <strong> markup in model-read snippets.
         .options = brave.types.SearchOptions{ .count = 10, .text_decorations = false },
         .format = formatBraveMarkdown,
@@ -1000,6 +1006,7 @@ const api_engines = .{
         .tag = SearchEngine.tavily,
         .env_var = "TAVILY_API_KEY",
         .Client = tavily.Client,
+        .init_options = tavily.Client.InitOptions{},
         .options = tavily.types.SearchOptions{ .max_results = 10 },
         .format = formatTavilyMarkdown,
     },
@@ -1007,83 +1014,148 @@ const api_engines = .{
         .tag = SearchEngine.exa,
         .env_var = "EXA_API_KEY",
         .Client = exa.Client,
+        .init_options = exa.Client.InitOptions{},
         // highlights: Exa returns no snippet text unless contents is requested;
         // capped at 3 sentences since the default excerpts run long.
         .options = exa.types.SearchOptions{ .numResults = 10, .contents = .{ .highlights = .{ .numSentences = 3 } } },
         .format = formatExaMarkdown,
     },
+    .{
+        .tag = SearchEngine.keenable,
+        .env_var = "KEENABLE_API_KEY",
+        .Client = keenable.Client,
+        .init_options = keenable.Client.InitOptions{ .app_title = "lightpanda" },
+        // snippet_max_length is a hint the API may round up to a word
+        // boundary; 500 keeps ten results within a few KB of context.
+        .options = keenable.types.SearchOptions{ .max_results = 10, .snippet_max_length = 500 },
+        .format = formatKeenableMarkdown,
+    },
 };
 
-pub fn searchEnvVar(engine: SearchEngine) ?[:0]const u8 {
+/// A `null` key routes an optional-key client to its public endpoint.
+fn isKeyless(comptime Client: type) bool {
+    return @typeInfo(@FieldType(Client, "api_key")) == .optional;
+}
+
+// `.auto` relies on a keyless engine as the rung that is always attempted.
+comptime {
+    const has_keyless = for (api_engines) |e| {
+        if (isKeyless(e.Client)) break true;
+    } else false;
+    if (!has_keyless) @compileError("api_engines needs a keyless engine");
+}
+
+/// `api_engines` rendered as prose.
+fn joinEngines(comptime field: enum { tag, env_var }, comptime last_sep: []const u8) []const u8 {
+    comptime {
+        var out: []const u8 = "";
+        for (api_engines, 0..) |e, i| {
+            const sep = if (i == 0) "" else if (i + 1 == api_engines.len) last_sep else ", ";
+            out = out ++ sep ++ switch (field) {
+                .tag => @tagName(e.tag),
+                .env_var => e.env_var,
+            };
+        }
+        return out;
+    }
+}
+
+/// Shared by the `search` tool description and the `/searchEngine` help;
+/// the keyless clause is the one part not generated from the table.
+pub const search_cascade_prose = "tries " ++ joinEngines(.tag, ", then ") ++ " in order, each when its API key (" ++ joinEngines(.env_var, " or ") ++ ") is set; keenable also works without a key through its public endpoint (rate-limited per client IP)";
+
+/// The key `engine` uses right now; `null` selects a keyless engine's
+/// public endpoint.
+fn engineKey(comptime engine: anytype) error{MissingApiKey}!?[]const u8 {
+    if (lp.environ().getPosix(engine.env_var)) |key| return key;
+    return if (comptime isKeyless(engine.Client)) null else error.MissingApiKey;
+}
+
+pub const KeyStatus = struct {
+    env_var: [:0]const u8,
+    state: enum { set, keyless, missing },
+};
+
+/// `null` for `.auto`, which has no key of its own.
+pub fn searchKeyStatus(engine: SearchEngine) ?KeyStatus {
     inline for (api_engines) |e| {
-        if (engine == e.tag) return e.env_var;
+        if (engine == e.tag) return .{
+            .env_var = e.env_var,
+            .state = if (engineKey(e)) |key| (if (key != null) .set else .keyless) else |_| .missing,
+        };
     }
     return null;
 }
 
-fn engineIndex(comptime tag: SearchEngine) usize {
-    inline for (api_engines, 0..) |e, i| {
-        if (e.tag == tag) return i;
-    }
-    @compileError("engine missing from api_engines: " ++ @tagName(tag));
-}
-
-fn execSearch(arena: std.mem.Allocator, session: *lp.Session, registry: *CDPNode.Registry, arguments: ?std.json.Value) ToolError!ToolResult {
+fn execSearch(arena: std.mem.Allocator, arguments: ?std.json.Value) ToolError!ToolResult {
     const args = try parseArgs(SearchParams, arena, arguments);
     if (args.query.len == 0) return ToolError.InvalidParams;
 
+    const timeout_ms = args.timeout orelse default_search_timeout_ms;
     switch (search_engine) {
-        // Any failure (network, non-2xx, parse) falls through to the next
-        // engine so a single outage doesn't kill a whole benchmark run.
-        .auto => inline for (api_engines) |engine| {
-            if (std.c.getenv(engine.env_var)) |api_key_z| {
-                if (apiSearch(engine, arena, std.mem.span(api_key_z), args.query)) |markdown_| {
-                    return .{ .text = markdown_ };
-                } else |err| {
-                    log.warn(.browser, @tagName(engine.tag) ++ " fallback", .{ .err = err });
-                }
+        .auto => {
+            var last_err: ?anyerror = null;
+            inline for (api_engines) |engine| {
+                if (engineKey(engine)) |api_key| {
+                    // Fall through on any failure so one outage doesn't kill
+                    // a whole benchmark run.
+                    if (apiSearch(engine, arena, api_key, timeout_ms, args.query)) |markdown_| {
+                        return .{ .text = markdown_ };
+                    } else |err| {
+                        last_err = err;
+                        log.warn(.browser, @tagName(engine.tag) ++ " fallback", .{ .err = err });
+                    }
+                } else |_| {}
             }
+            return searchFailed(arena, "web", last_err.?);
         },
-        .duckduckgo => {},
-        inline else => |tag| return searchExplicit(arena, api_engines[comptime engineIndex(tag)], args.query),
+        inline else => |tag| {
+            inline for (api_engines) |engine| {
+                if (engine.tag == tag) return searchExplicit(arena, engine, timeout_ms, args.query);
+            }
+            @compileError("engine missing from api_engines: " ++ @tagName(tag));
+        },
     }
-
-    const encoded = lp.URL.percentEncodeSegment(arena, args.query, .component) catch return ToolError.OutOfMemory;
-    const ddg_url = std.fmt.allocPrintSentinel(
-        arena,
-        "https://html.duckduckgo.com/html/?q={s}",
-        .{encoded},
-        0,
-    ) catch return ToolError.OutOfMemory;
-    _ = try performGoto(session, registry, ddg_url, .{ .timeout = args.timeout });
-    const ddg_frame = try requireFrame(session);
-    return .{ .text = try renderFrameMarkdown(arena, ddg_frame) };
 }
 
-/// Search with an explicitly selected engine: a missing key or a failed call
-/// comes back as an error result — no DDG fallback.
-fn searchExplicit(arena: std.mem.Allocator, comptime engine: anytype, query: []const u8) ToolError!ToolResult {
+/// No fallback: a failed call or a missing key is an error result.
+fn searchExplicit(arena: std.mem.Allocator, comptime engine: anytype, timeout_ms: u32, query: []const u8) ToolError!ToolResult {
     const label = @tagName(engine.tag);
-    const api_key_z = std.c.getenv(engine.env_var) orelse return .{
+    const api_key = engineKey(engine) catch return .{
         .text = "web search engine is set to " ++ label ++ " but " ++ engine.env_var ++ " is not set in the environment",
         .is_error = true,
     };
-    const markdown_ = apiSearch(engine, arena, std.mem.span(api_key_z), query) catch |err| {
-        const msg = std.fmt.allocPrint(arena, label ++ " search failed: {s}", .{@errorName(err)}) catch
-            return ToolError.OutOfMemory;
-        return .{ .text = msg, .is_error = true };
-    };
+    const markdown_ = apiSearch(engine, arena, api_key, timeout_ms, query) catch |err|
+        return searchFailed(arena, label, err);
     return .{ .text = markdown_ };
+}
+
+fn searchFailed(arena: std.mem.Allocator, comptime label: []const u8, err: anyerror) ToolError!ToolResult {
+    return .{
+        .text = try std.fmt.allocPrint(arena, label ++ " search failed: {s}", .{@errorName(err)}),
+        .is_error = true,
+    };
 }
 
 /// `arena` owns the returned slice.
 fn apiSearch(
     comptime engine: anytype,
     arena: std.mem.Allocator,
-    api_key: []const u8,
+    api_key: ?[]const u8,
+    timeout_ms: u32,
     query: []const u8,
 ) ![]const u8 {
-    var client: engine.Client = .init(lp.io, arena, api_key, .{});
+    var init_options = engine.init_options;
+    // The cascade (or the model) is the retry; honoring a Retry-After (60 s
+    // per sleep on the public endpoint) would stall the shared browser thread.
+    init_options.retry_policy = .disabled;
+    init_options.request_timeout_ms = timeout_ms;
+    var client: engine.Client = .init(
+        lp.io,
+        arena,
+        if (comptime isKeyless(engine.Client)) api_key else api_key.?,
+        init_options,
+    );
     defer client.deinit();
 
     var response = client.search(query, engine.options) catch |err| {
@@ -1132,13 +1204,25 @@ fn formatExaMarkdown(w: *std.Io.Writer, resp: exa.types.SearchResponse) !void {
     for (resp.results, 0..) |r, i| {
         const highlights = r.highlights orelse &[_][]const u8{};
         const snippet = if (highlights.len > 0) highlights[0] else "";
-        try writeResultItem(w, i, r.title orelse r.url, r.url, snippet);
+        try writeResultItem(w, i, r.title orelse "", r.url, snippet);
     }
 }
 
+fn formatKeenableMarkdown(w: *std.Io.Writer, resp: keenable.types.SearchResponse) !void {
+    if (resp.results.len == 0) {
+        return w.writeAll("No results.");
+    }
+    for (resp.results, 0..) |r, i| {
+        // snippet carries the page text (the wire format's always-empty
+        // `description` is deliberately not even mapped by the client).
+        try writeResultItem(w, i, r.title, r.url, r.snippet);
+    }
+}
+
+/// An empty title (providers default it to "") would render as `****`.
 fn writeResultItem(w: *std.Io.Writer, i: usize, title: []const u8, url: []const u8, snippet: []const u8) !void {
     try w.print("{d}. **", .{i + 1});
-    try writeSingleLine(w, title);
+    try writeSingleLine(w, if (title.len == 0) url else title);
     try w.print("** — {s}\n   ", .{url});
     try writeSingleLine(w, snippet);
     try w.writeAll("\n\n");
@@ -1190,27 +1274,45 @@ fn execMarkdown(arena: std.mem.Allocator, session: *lp.Session, registry: *CDPNo
     return aw.written();
 }
 
+const HtmlParams = struct {
+    selector: ?[]const u8 = null,
+    backendNodeId: ?CDPNode.Id = null,
+    maxBytes: ?u32 = null,
+    strip: lp.dump.Opts.Strip = .{},
+    url: ?[:0]const u8 = null,
+    timeout: ?u32 = null,
+};
+
 fn execHtml(arena: std.mem.Allocator, session: *lp.Session, registry: *CDPNode.Registry, arguments: ?std.json.Value) ToolError![]const u8 {
-    const Params = struct {
-        selector: ?[]const u8 = null,
-        backendNodeId: ?CDPNode.Id = null,
-        url: ?[:0]const u8 = null,
-        timeout: ?u32 = null,
-    };
-    const args = try parseArgsOrDefault(Params, arena, arguments);
+    const args = try parseArgsOrDefault(HtmlParams, arena, arguments);
     const page = try ensurePage(session, registry, args.url, args.timeout);
 
     var aw: std.Io.Writer.Allocating = .init(arena);
-    if (args.selector) |sel| {
-        const resolved = try resolveBySelector(session, sel);
-        lp.dump.deep(resolved.node, .{}, &aw.writer, resolved.page) catch return ToolError.InternalError;
-    } else if (args.backendNodeId) |nid| {
-        const resolved = try resolveNodeAndPage(session, registry, nid);
-        lp.dump.deep(resolved.node, .{}, &aw.writer, resolved.page) catch return ToolError.InternalError;
-    } else {
-        lp.dump.root(page.document, .{}, &aw.writer, page) catch return ToolError.InternalError;
+    var lw: LimitedWriter = .init(&aw.writer, args.maxBytes);
+    dumpHtml(session, registry, page, args, &lw.writer) catch |err| switch (err) {
+        error.WriteFailed => if (!lw.truncated) return ToolError.InternalError,
+        else => |e| return e,
+    };
+    if (lw.truncated) {
+        aw.writer.writeAll(LimitedWriter.truncation_marker) catch return ToolError.InternalError;
     }
     return aw.written();
+}
+
+fn dumpHtml(session: *lp.Session, registry: *CDPNode.Registry, page: *lp.Frame, args: HtmlParams, writer: *std.Io.Writer) (ToolError || error{WriteFailed})!void {
+    const opts: lp.dump.Opts = .{ .strip = args.strip };
+    if (args.selector) |sel| {
+        const resolved = try resolveBySelector(session, sel);
+        return lp.dump.deep(resolved.node, opts, writer, resolved.page);
+    }
+    if (args.backendNodeId) |nid| {
+        const resolved = try resolveNodeAndPage(session, registry, nid);
+        return lp.dump.deep(resolved.node, opts, writer, resolved.page);
+    }
+    return lp.dump.root(page.document, opts, writer, page) catch |err| switch (err) {
+        error.WriteFailed => error.WriteFailed,
+        else => ToolError.InternalError,
+    };
 }
 
 fn execLinks(arena: std.mem.Allocator, session: *lp.Session, registry: *CDPNode.Registry, arguments: ?std.json.Value) ToolError![]const u8 {
@@ -2484,6 +2586,44 @@ test "formatBraveMarkdown handles empty results" {
     var empty_web: std.Io.Writer.Allocating = .init(aa);
     try formatBraveMarkdown(&empty_web.writer, .{ .web = .{} });
     try std.testing.expectEqualStrings("No results.", empty_web.written());
+}
+
+test "formatKeenableMarkdown reads snippet" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const resp: keenable.types.SearchResponse = .{
+        .query = "zig",
+        .results = &.{
+            .{ .title = "Zig (programming language)", .url = "https://en.wikipedia.org/wiki/Zig", .snippet = "Zig is a system programming language." },
+            .{ .title = "Zig guide", .url = "https://example.org/zig", .snippet = "Compile-time execution." },
+        },
+    };
+
+    var aw: std.Io.Writer.Allocating = .init(aa);
+    try formatKeenableMarkdown(&aw.writer, resp);
+    const md = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, md, "1. **Zig (programming language)**") != null);
+    try std.testing.expect(std.mem.indexOf(u8, md, "Zig is a system programming language.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, md, "2. **Zig guide**") != null);
+    try std.testing.expect(std.mem.indexOf(u8, md, "Compile-time execution.") != null);
+}
+
+test "writeResultItem uses the URL as title when the title is empty" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var aw: std.Io.Writer.Allocating = .init(arena.allocator());
+    try writeResultItem(&aw.writer, 0, "", "https://example.org/x.pdf", "snippet");
+    try std.testing.expectEqualStrings("1. **https://example.org/x.pdf** — https://example.org/x.pdf\n   snippet\n\n", aw.written());
+}
+
+test "formatKeenableMarkdown handles empty results" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var aw: std.Io.Writer.Allocating = .init(arena.allocator());
+    try formatKeenableMarkdown(&aw.writer, .{});
+    try std.testing.expectEqualStrings("No results.", aw.written());
 }
 
 test "formatBraveMarkdown flattens newlines in titles and descriptions" {
