@@ -28,7 +28,6 @@ const keenable = zenai.search.keenable;
 
 const DOMNode = @import("webapi/Node.zig");
 const CDPNode = @import("../cdp/Node.zig");
-const LimitedWriter = @import("../LimitedWriter.zig");
 const Selector = @import("webapi/selector/Selector.zig");
 
 /// Conventions any LLM driving Lightpanda should follow. The standalone
@@ -400,9 +399,18 @@ pub const Tool = enum {
                 ),
             },
             .links => .{
-                .description = "Extract all links in the opened page as JSON objects with `text` (visible anchor text), `href` (resolved URL), and `backendNodeId` (pass to click/nodeDetails). If a url is provided, it navigates to that url first.",
+                .description = "Extract the visible links in the opened page as JSON objects with `text` (anchor text, falling back to aria-label/title/image alt), `href` (resolved URL), and `backendNodeId` (pass to click/nodeDetails). One entry per href; hidden links are omitted. If a url is provided, it navigates to that url first.",
                 .summary = "List all links on the page",
-                .input_schema = url_params_schema,
+                .input_schema = minify(
+                    \\{
+                    \\  "type": "object",
+                    \\  "properties": {
+                    \\    "limit": { "type": "integer", "description": "Optional. Return at most this many links, in document order." },
+                    \\    "url": { "type": "string", "description": "Optional URL to navigate to before processing." },
+                    \\    "timeout": { "type": "integer", "description": "Optional timeout in milliseconds. Defaults to 10000." }
+                    \\  }
+                    \\}
+                ),
             },
             .evaluate => .{
                 .description = "Evaluate JavaScript in the current page context — an escape hatch for page-side logic the dedicated tools can't express; prefer `extract` for data and click/fill/etc. for actions. It runs in the page, so it cannot see the agent script's variables or builtins — interpolate any value into the `script` string. A bare trailing expression yields its value; top-level `await` and `return` are supported (the body then runs as an async function, so use `return` to produce a value). Objects and arrays return as JSON, so no `JSON.stringify` is needed. If a url is provided, it navigates there first. The `globalThis.lp` object exposes a Session-scoped bridge store: values written via `lp.foo = ...` auto-sync at end of evaluate, surviving navigation; values previously set via `/extract save=` or `/evaluate save=` appear as `lp.<name>`.",
@@ -1287,40 +1295,34 @@ fn execHtml(arena: std.mem.Allocator, session: *lp.Session, registry: *CDPNode.R
     const args = try parseArgsOrDefault(HtmlParams, arena, arguments);
     const page = try ensurePage(session, registry, args.url, args.timeout);
 
+    const opts: lp.dump.Opts = .{ .strip = args.strip, .max_bytes = args.maxBytes };
     var aw: std.Io.Writer.Allocating = .init(arena);
-    var lw: LimitedWriter = .init(&aw.writer, args.maxBytes);
-    dumpHtml(session, registry, page, args, &lw.writer) catch |err| switch (err) {
-        error.WriteFailed => if (!lw.truncated) return ToolError.InternalError,
-        else => |e| return e,
-    };
-    if (lw.truncated) {
-        aw.writer.writeAll(LimitedWriter.truncation_marker) catch return ToolError.InternalError;
+    if (args.selector) |sel| {
+        const resolved = try resolveBySelector(session, sel);
+        lp.dump.deep(resolved.node, opts, &aw.writer, resolved.page) catch return ToolError.InternalError;
+    } else if (args.backendNodeId) |nid| {
+        const resolved = try resolveNodeAndPage(session, registry, nid);
+        lp.dump.deep(resolved.node, opts, &aw.writer, resolved.page) catch return ToolError.InternalError;
+    } else {
+        lp.dump.root(page.document, opts, &aw.writer, page) catch return ToolError.InternalError;
     }
     return aw.written();
 }
 
-fn dumpHtml(session: *lp.Session, registry: *CDPNode.Registry, page: *lp.Frame, args: HtmlParams, writer: *std.Io.Writer) (ToolError || error{WriteFailed})!void {
-    const opts: lp.dump.Opts = .{ .strip = args.strip };
-    if (args.selector) |sel| {
-        const resolved = try resolveBySelector(session, sel);
-        return lp.dump.deep(resolved.node, opts, writer, resolved.page);
-    }
-    if (args.backendNodeId) |nid| {
-        const resolved = try resolveNodeAndPage(session, registry, nid);
-        return lp.dump.deep(resolved.node, opts, writer, resolved.page);
-    }
-    return lp.dump.root(page.document, opts, writer, page) catch |err| switch (err) {
-        error.WriteFailed => error.WriteFailed,
-        else => ToolError.InternalError,
-    };
-}
-
 fn execLinks(arena: std.mem.Allocator, session: *lp.Session, registry: *CDPNode.Registry, arguments: ?std.json.Value) ToolError![]const u8 {
-    const args = try parseArgsOrDefault(UrlParams, arena, arguments);
+    const Params = struct {
+        limit: ?u32 = null,
+        url: ?[:0]const u8 = null,
+        timeout: ?u32 = null,
+    };
+    const args = try parseArgsOrDefault(Params, arena, arguments);
     const page = try ensurePage(session, registry, args.url, args.timeout);
 
-    const links_list = lp.links.collectLinks(arena, page.document.asNode(), page) catch
+    var links_list = lp.links.collectLinks(arena, page.document.asNode(), page) catch
         return ToolError.InternalError;
+    if (args.limit) |limit| {
+        links_list = links_list[0..@min(limit, links_list.len)];
+    }
     lp.links.registerNodes(links_list, registry) catch
         return ToolError.InternalError;
     return renderJson(arena, links_list);
